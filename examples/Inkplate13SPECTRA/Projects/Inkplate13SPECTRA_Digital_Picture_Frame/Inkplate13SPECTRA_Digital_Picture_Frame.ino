@@ -60,6 +60,11 @@ FrameConfig config;
 String photoList[MAX_PHOTOS];
 uint16_t photoCount = 0;
 String lastWebMessage;
+SdFile uploadFile;
+String uploadFinalPath;
+String uploadTempPath;
+String uploadResultMessage;
+bool uploadOk = false;
 
 static const uint8_t BIN_MAGIC[8] = {'I', 'P', '1', '3', 'S', 'P', '6', 'B'};
 
@@ -194,6 +199,7 @@ String htmlEscape(String value)
 {
     value.replace("&", "&amp;");
     value.replace("\"", "&quot;");
+    value.replace("'", "&#39;");
     value.replace("<", "&lt;");
     value.replace(">", "&gt;");
     return value;
@@ -253,6 +259,15 @@ String joinPath(const char *dir, const String &name)
     return path;
 }
 
+String photoRoot()
+{
+    String root = config.photoDir;
+    root.trim();
+    while (root.length() > 1 && root.endsWith("/"))
+        root.remove(root.length() - 1);
+    return root;
+}
+
 bool hasSupportedExtension(String name)
 {
     name.toLowerCase();
@@ -283,6 +298,95 @@ String sanitizeFilename(String name, uint16_t fallbackIndex)
             out += '_';
     }
     return out;
+}
+
+String sanitizePathSegment(String segment)
+{
+    segment.trim();
+    if (segment == "." || segment == "..")
+        return "";
+
+    String out;
+    for (size_t i = 0; i < segment.length() && out.length() < 60; ++i)
+    {
+        char c = segment[i];
+        if (isalnum(c) || c == '.' || c == '_' || c == '-' || c == ' ' || c == '(' || c == ')')
+            out += c;
+        else
+            out += '_';
+    }
+    out.trim();
+    return out;
+}
+
+String normalizeManagedPath(String input, bool allowRoot)
+{
+    String root = photoRoot();
+    String raw = input;
+    raw.replace('\\', '/');
+    raw.trim();
+    if (raw.length() == 0)
+        raw = root;
+
+    String rel;
+    if (raw == root)
+    {
+        rel = "";
+    }
+    else if (raw.startsWith(root + "/"))
+    {
+        rel = raw.substring(root.length() + 1);
+    }
+    else
+    {
+        while (raw.startsWith("/"))
+            raw.remove(0, 1);
+        rel = raw;
+    }
+
+    String out = root;
+    while (rel.length())
+    {
+        int slash = rel.indexOf('/');
+        String segment = slash >= 0 ? rel.substring(0, slash) : rel;
+        rel = slash >= 0 ? rel.substring(slash + 1) : "";
+
+        segment.trim();
+        if (segment.length() == 0 || segment == ".")
+            continue;
+        if (segment == "..")
+            return "";
+
+        String safe = sanitizePathSegment(segment);
+        if (safe.length() == 0)
+            return "";
+        out += "/";
+        out += safe;
+    }
+
+    if (!allowRoot && out == root)
+        return "";
+    return out;
+}
+
+String sanitizeUploadFilename(String filename)
+{
+    filename.replace('\\', '/');
+    int slash = filename.lastIndexOf('/');
+    if (slash >= 0)
+        filename = filename.substring(slash + 1);
+    int query = filename.indexOf('?');
+    if (query >= 0)
+        filename.remove(query);
+    filename.trim();
+
+    if (!hasSupportedExtension(filename))
+        return "";
+
+    String safe = sanitizePathSegment(filename);
+    if (!hasSupportedExtension(safe))
+        return "";
+    return safe;
 }
 
 void showStatus(const String &title, const String &line1 = "", const String &line2 = "", const String &line3 = "")
@@ -336,26 +440,154 @@ bool connectWiFi(uint32_t timeoutMs)
     return WiFi.status() == WL_CONNECTED;
 }
 
-uint16_t scanPhotos()
+void scanPhotosInDir(const String &dirPath, uint8_t depth)
 {
-    photoCount = 0;
+    if (photoCount >= MAX_PHOTOS || depth > 5)
+        return;
+
     SdFile dir;
-    if (!dir.open(config.photoDir, O_RDONLY) || !dir.isDir())
-        return 0;
+    if (!dir.open(dirPath.c_str(), O_RDONLY) || !dir.isDir())
+    {
+        dir.close();
+        return;
+    }
 
     SdFile entry;
     while (photoCount < MAX_PHOTOS && entry.openNext(&dir, O_RDONLY))
     {
-        if (!entry.isDir())
+        char name[96];
+        if (!entry.getName(name, sizeof(name)))
         {
-            char name[96];
-            if (entry.getName(name, sizeof(name)) && hasSupportedExtension(String(name)))
-                photoList[photoCount++] = joinPath(config.photoDir, String(name));
+            entry.close();
+            continue;
         }
+
+        String childPath = joinPath(dirPath.c_str(), String(name));
+        bool isDirectory = entry.isDir();
+        if (!isDirectory && hasSupportedExtension(String(name)))
+            photoList[photoCount++] = childPath;
         entry.close();
+
+        if (isDirectory)
+            scanPhotosInDir(childPath, depth + 1);
     }
     dir.close();
+}
+
+uint16_t scanPhotos()
+{
+    photoCount = 0;
+    scanPhotosInDir(photoRoot(), 0);
     return photoCount;
+}
+
+bool deleteManagedFile(const String &path)
+{
+    String managed = normalizeManagedPath(path, false);
+    if (managed.length() == 0 || !hasSupportedExtension(managed))
+        return false;
+
+    SdFile file;
+    if (!file.open(managed.c_str(), O_RDONLY) || file.isDir())
+    {
+        file.close();
+        return false;
+    }
+    file.close();
+    return display.getSdFat().remove(managed.c_str());
+}
+
+bool createManagedFolder(const String &path)
+{
+    String managed = normalizeManagedPath(path, false);
+    if (managed.length() == 0)
+        return false;
+    return display.getSdFat().mkdir(managed.c_str(), true);
+}
+
+bool deleteManagedFolder(const String &path)
+{
+    String managed = normalizeManagedPath(path, false);
+    if (managed.length() == 0)
+        return false;
+
+    SdFile folder;
+    if (!folder.open(managed.c_str(), O_RDONLY) || !folder.isDir())
+    {
+        folder.close();
+        return false;
+    }
+
+    bool ok = folder.rmRfStar();
+    if (!ok)
+        folder.close();
+    return ok;
+}
+
+void appendFileManagerRows(String &html, const String &dirPath, uint8_t depth, uint16_t &rows)
+{
+    if (rows >= 200 || depth > 5)
+        return;
+
+    SdFile dir;
+    if (!dir.open(dirPath.c_str(), O_RDONLY) || !dir.isDir())
+    {
+        dir.close();
+        return;
+    }
+
+    SdFile entry;
+    while (rows < 200 && entry.openNext(&dir, O_RDONLY))
+    {
+        char name[96];
+        if (!entry.getName(name, sizeof(name)))
+        {
+            entry.close();
+            continue;
+        }
+
+        String childPath = joinPath(dirPath.c_str(), String(name));
+        String indent;
+        for (uint8_t i = 0; i < depth; ++i)
+            indent += "&nbsp;&nbsp;&nbsp;";
+
+        html += "<tr><td>";
+        html += indent;
+        html += entry.isDir() ? "Folder " : "File ";
+        html += htmlEscape(name);
+        html += "</td><td>";
+        if (entry.isDir())
+        {
+            html += "-";
+        }
+        else
+        {
+            html += String(entry.fileSize());
+            html += " bytes";
+        }
+        html += "</td><td>";
+        if (entry.isDir())
+        {
+            html += "<form method='POST' action='/delete_folder' onsubmit=\"return confirm('Delete folder and contents?')\">";
+            html += "<input type='hidden' name='path' value='" + htmlEscape(childPath) + "'>";
+            html += "<button type='submit'>Delete folder</button></form>";
+        }
+        else if (hasSupportedExtension(String(name)))
+        {
+            html += "<form method='POST' action='/delete_file' onsubmit=\"return confirm('Delete file?')\">";
+            html += "<input type='hidden' name='path' value='" + htmlEscape(childPath) + "'>";
+            html += "<button type='submit'>Delete file</button></form>";
+        }
+        html += "</td></tr>";
+        rows++;
+
+        bool isDirectory = entry.isDir();
+        entry.close();
+        if (isDirectory)
+            appendFileManagerRows(html, childPath, depth + 1, rows);
+    }
+
+    dir.close();
 }
 
 bool drawBinFromSd(const char *path)
@@ -927,6 +1159,8 @@ void handleIndex()
     html += "body{font-family:Arial,sans-serif;max-width:760px;margin:24px auto;padding:0 16px;line-height:1.4}";
     html += "label{display:block;margin-top:12px;font-weight:600}input{width:100%;box-sizing:border-box;padding:8px}";
     html += "button{margin-top:16px;padding:10px 14px}.row{margin:14px 0;padding:12px;background:#f4f4f4}";
+    html += "table{width:100%;border-collapse:collapse;margin-top:12px}td,th{border-bottom:1px solid #ddd;padding:6px;text-align:left}";
+    html += "td form{margin:0}td button{margin:0;padding:6px 8px}";
     html += "</style></head><body><h1>Inkplate 13 Picture Frame</h1>";
     html += "<div class='row'>AP: " + WiFi.softAPIP().toString();
     if (WiFi.status() == WL_CONNECTED)
@@ -950,9 +1184,31 @@ void handleIndex()
     html += "> Shuffle photos</label><button type='submit'>Save settings</button></form>";
     html += "<form method='POST' action='/sync'><button type='submit'>Sync photos now</button></form>";
     html += "<form method='POST' action='/show'><button type='submit'>Show next local photo</button></form>";
+    html += "<h2>Files</h2>";
+    html += "<div class='row'>Photo root: " + htmlEscape(photoRoot()) + "</div>";
+    html += "<form id='uploadForm' method='POST' action='/upload?folder=" + urlEncode(photoRoot()) +
+            "' enctype='multipart/form-data' onsubmit=\"this.action='/upload?folder='+encodeURIComponent(document.getElementById('uploadFolder').value)\">";
+    html += "<label>Upload folder</label><input id='uploadFolder' name='folder' value='" + htmlEscape(photoRoot()) + "'>";
+    html += "<label>Image file</label><input type='file' name='image' accept='.bin,.jpg,.jpeg,.png,.bmp,image/jpeg,image/png,image/bmp'>";
+    html += "<button type='submit'>Upload image</button></form>";
+    html += "<form method='POST' action='/mkdir'>";
+    html += "<label>New folder</label><input name='path' placeholder='Trips/2026'>";
+    html += "<button type='submit'>Create folder</button></form>";
+    html += "<table><tr><th>Name</th><th>Size</th><th>Action</th></tr>";
+    uint16_t rows = 0;
+    appendFileManagerRows(html, photoRoot(), 0, rows);
+    if (rows == 0)
+        html += "<tr><td colspan='3'>No files found</td></tr>";
+    html += "</table>";
     html += "<form method='POST' action='/reboot'><button type='submit'>Reboot to frame mode</button></form>";
     html += "</body></html>";
     server.send(200, "text/html", html);
+}
+
+void redirectHome()
+{
+    server.sendHeader("Location", "/");
+    server.send(303, "text/plain", "");
 }
 
 void handleSave()
@@ -1008,6 +1264,119 @@ void handleShow()
     server.send(303, "text/plain", "");
 }
 
+void handleCreateFolder()
+{
+    String requestedPath = server.arg("path");
+    if (createManagedFolder(requestedPath))
+        lastWebMessage = "Folder created.";
+    else
+        lastWebMessage = "Folder create failed.";
+    redirectHome();
+}
+
+void handleDeleteFile()
+{
+    String requestedPath = server.arg("path");
+    if (deleteManagedFile(requestedPath))
+        lastWebMessage = "File deleted.";
+    else
+        lastWebMessage = "File delete failed.";
+    scanPhotos();
+    redirectHome();
+}
+
+void handleDeleteFolder()
+{
+    String requestedPath = server.arg("path");
+    if (deleteManagedFolder(requestedPath))
+        lastWebMessage = "Folder deleted.";
+    else
+        lastWebMessage = "Folder delete failed.";
+    scanPhotos();
+    redirectHome();
+}
+
+void handleUploadComplete()
+{
+    if (uploadResultMessage.length() == 0)
+        uploadResultMessage = "No upload received.";
+    lastWebMessage = uploadResultMessage;
+    scanPhotos();
+    redirectHome();
+}
+
+void handleUpload()
+{
+    HTTPUpload &upload = server.upload();
+    SdFat &sd = display.getSdFat();
+
+    if (upload.status == UPLOAD_FILE_START)
+    {
+        uploadOk = false;
+        uploadFinalPath = "";
+        uploadTempPath = "";
+        uploadResultMessage = "";
+
+        String folder = normalizeManagedPath(server.arg("folder"), true);
+        String filename = sanitizeUploadFilename(upload.filename);
+        if (folder.length() == 0 || filename.length() == 0)
+        {
+            uploadResultMessage = "Upload rejected: unsupported file name.";
+            return;
+        }
+
+        sd.mkdir(folder.c_str(), true);
+        uploadFinalPath = joinPath(folder.c_str(), filename);
+        uploadTempPath = uploadFinalPath + ".upload";
+        sd.remove(uploadTempPath.c_str());
+
+        uploadOk = uploadFile.open(uploadTempPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC);
+        if (!uploadOk)
+            uploadResultMessage = "Upload failed: could not open file.";
+    }
+    else if (upload.status == UPLOAD_FILE_WRITE)
+    {
+        if (!uploadOk)
+            return;
+
+        size_t written = uploadFile.write(upload.buf, upload.currentSize);
+        if (written != upload.currentSize)
+        {
+            uploadOk = false;
+            uploadResultMessage = "Upload failed: SD write error.";
+        }
+    }
+    else if (upload.status == UPLOAD_FILE_END)
+    {
+        if (uploadTempPath.length())
+            uploadFile.close();
+        if (uploadOk)
+        {
+            sd.remove(uploadFinalPath.c_str());
+            if (sd.rename(uploadTempPath.c_str(), uploadFinalPath.c_str()))
+                uploadResultMessage = "Uploaded " + uploadFinalPath;
+            else
+            {
+                sd.remove(uploadTempPath.c_str());
+                uploadResultMessage = "Upload failed: rename error.";
+            }
+        }
+        else if (uploadTempPath.length())
+        {
+            sd.remove(uploadTempPath.c_str());
+        }
+    }
+    else if (upload.status == UPLOAD_FILE_ABORTED)
+    {
+        if (uploadTempPath.length())
+            uploadFile.close();
+        if (uploadTempPath.length())
+            sd.remove(uploadTempPath.c_str());
+        uploadOk = false;
+        uploadResultMessage = "Upload aborted.";
+    }
+}
+
 void handleReboot()
 {
     display.getSdFat().remove(CONFIG_TRIGGER_PATH);
@@ -1035,6 +1404,10 @@ void runConfigMode()
     server.on("/save", HTTP_POST, handleSave);
     server.on("/sync", HTTP_POST, handleSync);
     server.on("/show", HTTP_POST, handleShow);
+    server.on("/upload", HTTP_POST, handleUploadComplete, handleUpload);
+    server.on("/mkdir", HTTP_POST, handleCreateFolder);
+    server.on("/delete_file", HTTP_POST, handleDeleteFile);
+    server.on("/delete_folder", HTTP_POST, handleDeleteFolder);
     server.on("/reboot", HTTP_POST, handleReboot);
     server.begin();
 

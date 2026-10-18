@@ -36,6 +36,10 @@ On first boot, the frame starts an access point named `Inkplate13Frame` with pas
 
 To force config mode later, create an empty file at `/frame/config_mode.txt`. If your hardware exposes USB/VBUS detection on a GPIO, set `USB_POWER_DETECT_PIN` near the top of the sketch so USB power automatically enters config mode.
 
+## File Management
+
+The config page includes an SD file manager scoped to the configured photo folder. Use it to upload `.bin`, `.jpg`, `.jpeg`, `.png`, or `.bmp` images, create subfolders, delete individual image files, and recursively delete subfolders. Photo playback scans subfolders too. Deleting the photo root itself is blocked so settings and sync state stay intact.
+
 ## BIN Conversion
 
 Install Pillow, then convert images:
