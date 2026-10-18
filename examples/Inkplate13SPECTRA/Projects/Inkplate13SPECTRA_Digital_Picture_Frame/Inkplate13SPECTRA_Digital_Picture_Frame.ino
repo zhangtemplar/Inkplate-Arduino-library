@@ -68,6 +68,9 @@ String uploadFinalPath;
 String uploadTempPath;
 String uploadResultMessage;
 bool uploadOk = false;
+bool configReconnectPending = false;
+uint32_t configReconnectAt = 0;
+bool configApRunning = false;
 
 static const uint8_t BIN_MAGIC[8] = {'I', 'P', '1', '3', 'S', 'P', '6', 'B'};
 
@@ -461,7 +464,7 @@ bool reconnectConfigWiFi(uint32_t timeoutMs)
 
     WiFi.disconnect(false);
     delay(100);
-    WiFi.mode(WIFI_AP_STA);
+    WiFi.mode(configApRunning ? WIFI_AP_STA : WIFI_STA);
     WiFi.begin(config.wifiSsid, config.wifiPassword);
 
     uint32_t start = millis();
@@ -470,20 +473,65 @@ bool reconnectConfigWiFi(uint32_t timeoutMs)
     return WiFi.status() == WL_CONNECTED;
 }
 
+void startConfigAp()
+{
+    if (configApRunning)
+        return;
+
+    WiFi.mode(strlen(config.wifiSsid) > 0 ? WIFI_AP_STA : WIFI_AP);
+    WiFi.softAP(AP_SSID, AP_PASSWORD);
+    configApRunning = true;
+}
+
+void stopConfigAp()
+{
+    if (!configApRunning)
+        return;
+
+    WiFi.softAPdisconnect(true);
+    configApRunning = false;
+    WiFi.mode(WiFi.status() == WL_CONNECTED ? WIFI_STA : WIFI_OFF);
+}
+
+bool refreshConfigNetwork(uint32_t timeoutMs)
+{
+    bool wifiConnected = reconnectConfigWiFi(timeoutMs);
+    if (wifiConnected)
+        stopConfigAp();
+    else
+        startConfigAp();
+    return wifiConnected;
+}
+
 void showConfigStatus()
 {
-    String line1 = String("AP: ") + AP_SSID + " / " + AP_PASSWORD;
-    String line2 = String("AP IP: ") + WiFi.softAPIP().toString();
-    String line3;
+    String line1;
+    String line2;
+    String line3 = "WAKE exits config mode";
 
     if (WiFi.status() == WL_CONNECTED)
-        line3 = String("WiFi IP: ") + WiFi.localIP().toString();
+    {
+        line1 = String("Web UI: http://") + WiFi.localIP().toString();
+        line2 = configApRunning ? String("AP fallback: http://") + WiFi.softAPIP().toString() :
+                                  "AP disabled: home WiFi active";
+    }
+    else if (configApRunning)
+    {
+        line1 = String("AP: ") + AP_SSID + " / " + AP_PASSWORD;
+        line2 = String("Web UI: http://") + WiFi.softAPIP().toString();
+    }
     else if (strlen(config.wifiSsid) > 0)
-        line3 = String("WiFi not connected: ") + config.wifiSsid;
+    {
+        line1 = String("WiFi not connected: ") + config.wifiSsid;
+        line2 = "Starting fallback AP...";
+    }
     else
-        line3 = "Set WiFi in web UI";
+    {
+        line1 = "WiFi not configured";
+        line2 = "Starting fallback AP...";
+    }
 
-    showStatus("Config mode", line1, line2, line3 + " | WAKE exits");
+    showStatus("Config mode", line1, line2, line3);
 }
 
 void scanPhotosInDir(const String &dirPath, uint8_t depth)
@@ -1246,12 +1294,22 @@ void handleIndex()
     html += "table{width:100%;border-collapse:collapse;margin-top:12px}td,th{border-bottom:1px solid #ddd;padding:6px;text-align:left}";
     html += "td form{margin:0}td button{margin:0;padding:6px 8px}";
     html += "</style></head><body><h1>Inkplate 13 Picture Frame</h1>";
-    html += "<div class='row'>Config AP: " + String(AP_SSID) + " / " + String(AP_PASSWORD);
-    html += "<br>AP IP: " + WiFi.softAPIP().toString();
+    html += "<div class='row'>";
     if (WiFi.status() == WL_CONNECTED)
-        html += "<br>Home WiFi IP: " + WiFi.localIP().toString();
+        html += "Home WiFi IP: " + WiFi.localIP().toString();
     else if (strlen(config.wifiSsid) > 0)
-        html += "<br>Home WiFi: not connected";
+        html += "Home WiFi: not connected";
+    else
+        html += "Home WiFi: not configured";
+    if (configApRunning)
+    {
+        html += "<br>Config AP: " + String(AP_SSID) + " / " + String(AP_PASSWORD);
+        html += "<br>AP IP: " + WiFi.softAPIP().toString();
+    }
+    else
+    {
+        html += "<br>Config AP: disabled";
+    }
     html += "<br>Photos found: " + String(scanPhotos()) + "<br>" + htmlEscape(lastWebMessage) + "</div>";
     html += "<form method='POST' action='/save'>";
     html += "<label>WiFi SSID</label><input name='ssid' value='" + htmlEscape(config.wifiSsid) + "'>";
@@ -1321,9 +1379,9 @@ void handleSave()
     updatesSinceLastSync = config.syncEveryUpdates;
     syncCounterInitialized = true;
     display.getSdFat().remove(CONFIG_TRIGGER_PATH);
-    bool wifiConnected = reconnectConfigWiFi(12000);
-    lastWebMessage = wifiConnected ? "Settings saved. WiFi connected." : "Settings saved. WiFi not connected.";
-    showConfigStatus();
+    configReconnectPending = true;
+    configReconnectAt = millis() + 1500;
+    lastWebMessage = "Settings saved. Reconnecting WiFi...";
     server.sendHeader("Location", "/");
     server.send(303, "text/plain", "");
 }
@@ -1476,9 +1534,12 @@ void handleReboot()
 
 void runConfigMode()
 {
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
-    reconnectConfigWiFi(8000);
+    bool wifiConnected = refreshConfigNetwork(12000);
+    if (lastWebMessage.length() == 0)
+    {
+        lastWebMessage = wifiConnected ? "Serving config on home WiFi. Config AP disabled." :
+                                         "Serving config on fallback AP.";
+    }
     showConfigStatus();
 
     server.on("/", HTTP_GET, handleIndex);
@@ -1500,6 +1561,16 @@ void runConfigMode()
     {
         server.handleClient();
 
+        if (configReconnectPending && millis() - configReconnectAt < 0x80000000UL)
+        {
+            configReconnectPending = false;
+            bool wifiConnected = refreshConfigNetwork(12000);
+            lastWebMessage = wifiConnected ? String("Settings saved. WiFi connected at http://") +
+                                                  WiFi.localIP().toString() + ". Config AP disabled." :
+                                              "Settings saved. WiFi not connected. Config AP enabled.";
+            showConfigStatus();
+        }
+
         bool rawButton = wakeButtonPressed();
         if (rawButton != lastRawButton)
         {
@@ -1516,6 +1587,7 @@ void runConfigMode()
                 lastWebMessage = "Config mode closed with WAKE button.";
                 showStatus("Photo mode", "Web config closed.", "Returning to frame mode...");
                 WiFi.softAPdisconnect(true);
+                configApRunning = false;
                 WiFi.disconnect(true);
                 WiFi.mode(WIFI_OFF);
                 return;
