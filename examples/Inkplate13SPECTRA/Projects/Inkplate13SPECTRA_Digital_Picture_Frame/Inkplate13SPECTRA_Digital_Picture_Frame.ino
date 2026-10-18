@@ -24,6 +24,9 @@
 // With the default -1, config mode starts on first boot or when /frame/config_mode.txt exists.
 #define USB_POWER_DETECT_PIN -1
 #define USB_POWER_ACTIVE_LEVEL HIGH
+#define WAKE_BUTTON_PIN GPIO_NUM_18
+#define WAKE_BUTTON_ACTIVE_LEVEL LOW
+#define WAKE_BUTTON_DEBOUNCE_MS 60
 
 static const char *CONFIG_PATH = "/frame/config.json";
 static const char *SYNC_STATE_PATH = "/frame/sync_state.json";
@@ -422,6 +425,17 @@ bool usbPowerDetected()
     }
 #endif
     return false;
+}
+
+bool wakeButtonPressed()
+{
+    pinMode(WAKE_BUTTON_PIN, INPUT);
+    return digitalRead(WAKE_BUTTON_PIN) == WAKE_BUTTON_ACTIVE_LEVEL;
+}
+
+bool wakeButtonRequestedConfig()
+{
+    return esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0 || wakeButtonPressed();
 }
 
 bool connectWiFi(uint32_t timeoutMs)
@@ -1089,6 +1103,7 @@ void sleepForMinutes(uint32_t minutes)
     display.sdCardSleep();
     WiFi.mode(WIFI_OFF);
     esp_sleep_enable_timer_wakeup((uint64_t)minutes * 60ULL * 1000000ULL);
+    esp_sleep_enable_ext0_wakeup(WAKE_BUTTON_PIN, WAKE_BUTTON_ACTIVE_LEVEL);
     esp_deep_sleep_start();
 }
 
@@ -1397,8 +1412,8 @@ void runConfigMode()
             delay(250);
     }
 
-    showStatus("Config mode", String("WiFi AP: ") + AP_SSID, String("Password: ") + AP_PASSWORD,
-               "Open http://" + WiFi.softAPIP().toString());
+    showStatus("Config mode", String("AP: ") + AP_SSID + " Pass: " + AP_PASSWORD,
+               "Open http://" + WiFi.softAPIP().toString(), "Press WAKE to return");
 
     server.on("/", HTTP_GET, handleIndex);
     server.on("/save", HTTP_POST, handleSave);
@@ -1411,10 +1426,37 @@ void runConfigMode()
     server.on("/reboot", HTTP_POST, handleReboot);
     server.begin();
 
+    bool lastRawButton = wakeButtonPressed();
+    bool stableButton = lastRawButton;
+    uint32_t lastButtonChange = millis();
+
     while (true)
     {
         server.handleClient();
-        delay(5);
+
+        bool rawButton = wakeButtonPressed();
+        if (rawButton != lastRawButton)
+        {
+            lastRawButton = rawButton;
+            lastButtonChange = millis();
+        }
+
+        if (rawButton != stableButton && millis() - lastButtonChange >= WAKE_BUTTON_DEBOUNCE_MS)
+        {
+            stableButton = rawButton;
+            if (stableButton)
+            {
+                display.getSdFat().remove(CONFIG_TRIGGER_PATH);
+                lastWebMessage = "Config mode closed with WAKE button.";
+                showStatus("Photo mode", "Web config closed.", "Returning to frame mode...");
+                WiFi.softAPdisconnect(true);
+                WiFi.disconnect(true);
+                WiFi.mode(WIFI_OFF);
+                return;
+            }
+        }
+
+        delay(10);
     }
 }
 
@@ -1438,7 +1480,7 @@ void setup()
         saveConfig();
 
     bool forceConfig = display.getSdFat().exists(CONFIG_TRIGGER_PATH);
-    if (!hadConfig || forceConfig || usbPowerDetected())
+    if (!hadConfig || forceConfig || usbPowerDetected() || wakeButtonRequestedConfig())
         runConfigMode();
 
     runFrameMode();
