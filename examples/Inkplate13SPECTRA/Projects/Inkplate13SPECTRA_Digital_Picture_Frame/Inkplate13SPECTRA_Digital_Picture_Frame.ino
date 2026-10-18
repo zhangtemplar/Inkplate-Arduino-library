@@ -519,23 +519,60 @@ bool createManagedFolder(const String &path)
     return display.getSdFat().mkdir(managed.c_str(), true);
 }
 
+bool deleteFolderRecursive(const String &path, uint8_t depth)
+{
+    if (depth > 8)
+        return false;
+
+    SdFat &sd = display.getSdFat();
+    SdFile folder;
+    if (!folder.open(path.c_str(), O_RDONLY) || !folder.isDir())
+    {
+        folder.close();
+        return false;
+    }
+
+    SdFile entry;
+    while (entry.openNext(&folder, O_RDONLY))
+    {
+        char name[96];
+        if (!entry.getName(name, sizeof(name)))
+        {
+            entry.close();
+            folder.close();
+            return false;
+        }
+
+        String childPath = joinPath(path.c_str(), String(name));
+        bool isDirectory = entry.isDir();
+        entry.close();
+
+        if (isDirectory)
+        {
+            if (!deleteFolderRecursive(childPath, depth + 1))
+            {
+                folder.close();
+                return false;
+            }
+        }
+        else if (!sd.remove(childPath.c_str()))
+        {
+            folder.close();
+            return false;
+        }
+    }
+
+    folder.close();
+    return sd.rmdir(path.c_str());
+}
+
 bool deleteManagedFolder(const String &path)
 {
     String managed = normalizeManagedPath(path, false);
     if (managed.length() == 0)
         return false;
 
-    SdFile folder;
-    if (!folder.open(managed.c_str(), O_RDONLY) || !folder.isDir())
-    {
-        folder.close();
-        return false;
-    }
-
-    bool ok = folder.rmRfStar();
-    if (!ok)
-        folder.close();
-    return ok;
+    return deleteFolderRecursive(managed, 0);
 }
 
 void appendFileManagerRows(String &html, const String &dirPath, uint8_t depth, uint16_t &rows)
