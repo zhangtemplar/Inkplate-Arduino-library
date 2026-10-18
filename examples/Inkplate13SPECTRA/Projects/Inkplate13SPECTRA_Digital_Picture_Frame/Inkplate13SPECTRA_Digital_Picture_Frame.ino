@@ -454,6 +454,38 @@ bool connectWiFi(uint32_t timeoutMs)
     return WiFi.status() == WL_CONNECTED;
 }
 
+bool reconnectConfigWiFi(uint32_t timeoutMs)
+{
+    if (strlen(config.wifiSsid) == 0)
+        return false;
+
+    WiFi.disconnect(false);
+    delay(100);
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(config.wifiSsid, config.wifiPassword);
+
+    uint32_t start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < timeoutMs)
+        delay(250);
+    return WiFi.status() == WL_CONNECTED;
+}
+
+void showConfigStatus()
+{
+    String line1 = String("AP: ") + AP_SSID + " / " + AP_PASSWORD;
+    String line2 = String("AP IP: ") + WiFi.softAPIP().toString();
+    String line3;
+
+    if (WiFi.status() == WL_CONNECTED)
+        line3 = String("WiFi IP: ") + WiFi.localIP().toString();
+    else if (strlen(config.wifiSsid) > 0)
+        line3 = String("WiFi not connected: ") + config.wifiSsid;
+    else
+        line3 = "Set WiFi in web UI";
+
+    showStatus("Config mode", line1, line2, line3 + " | WAKE exits");
+}
+
 void scanPhotosInDir(const String &dirPath, uint8_t depth)
 {
     if (photoCount >= MAX_PHOTOS || depth > 5)
@@ -1214,9 +1246,12 @@ void handleIndex()
     html += "table{width:100%;border-collapse:collapse;margin-top:12px}td,th{border-bottom:1px solid #ddd;padding:6px;text-align:left}";
     html += "td form{margin:0}td button{margin:0;padding:6px 8px}";
     html += "</style></head><body><h1>Inkplate 13 Picture Frame</h1>";
-    html += "<div class='row'>AP: " + WiFi.softAPIP().toString();
+    html += "<div class='row'>Config AP: " + String(AP_SSID) + " / " + String(AP_PASSWORD);
+    html += "<br>AP IP: " + WiFi.softAPIP().toString();
     if (WiFi.status() == WL_CONNECTED)
-        html += "<br>WiFi: " + WiFi.localIP().toString();
+        html += "<br>Home WiFi IP: " + WiFi.localIP().toString();
+    else if (strlen(config.wifiSsid) > 0)
+        html += "<br>Home WiFi: not connected";
     html += "<br>Photos found: " + String(scanPhotos()) + "<br>" + htmlEscape(lastWebMessage) + "</div>";
     html += "<form method='POST' action='/save'>";
     html += "<label>WiFi SSID</label><input name='ssid' value='" + htmlEscape(config.wifiSsid) + "'>";
@@ -1286,7 +1321,9 @@ void handleSave()
     updatesSinceLastSync = config.syncEveryUpdates;
     syncCounterInitialized = true;
     display.getSdFat().remove(CONFIG_TRIGGER_PATH);
-    lastWebMessage = "Settings saved.";
+    bool wifiConnected = reconnectConfigWiFi(12000);
+    lastWebMessage = wifiConnected ? "Settings saved. WiFi connected." : "Settings saved. WiFi not connected.";
+    showConfigStatus();
     server.sendHeader("Location", "/");
     server.send(303, "text/plain", "");
 }
@@ -1441,16 +1478,8 @@ void runConfigMode()
 {
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(AP_SSID, AP_PASSWORD);
-    if (strlen(config.wifiSsid) > 0)
-    {
-        WiFi.begin(config.wifiSsid, config.wifiPassword);
-        uint32_t start = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - start < 8000)
-            delay(250);
-    }
-
-    showStatus("Config mode", String("AP: ") + AP_SSID + " Pass: " + AP_PASSWORD,
-               "Open http://" + WiFi.softAPIP().toString(), "Press WAKE to return");
+    reconnectConfigWiFi(8000);
+    showConfigStatus();
 
     server.on("/", HTTP_GET, handleIndex);
     server.on("/save", HTTP_POST, handleSave);

@@ -32,7 +32,7 @@ The manifest includes `id`, `name`, `modified`, and `size`. The Inkplate saves `
 
 ## Config Mode
 
-On first boot, the frame starts an access point named `Inkplate13Frame` with password `inkplate13`. Open the IP shown on the display, usually `http://192.168.4.1`. Configure Wi-Fi, Apps Script URL, sync token, sync cadence, photo folder, shuffle mode, update interval, and low-battery threshold.
+On first boot, the frame starts an access point named `Inkplate13Frame` with password `inkplate13`. Open the IP shown on the display, usually `http://192.168.4.1`. Configure Wi-Fi, Apps Script URL, sync token, sync cadence, photo folder, shuffle mode, update interval, and low-battery threshold. The AP stays available as a fallback in config mode; when home Wi-Fi connects, the display and web page also show the home-network IP address.
 
 To force config mode later, press the Inkplate 13SPECTRA WAKE button while the frame is sleeping; the sketch enables GPIO18 as a config-mode wake source. While config mode is running, press WAKE again to close the web UI and return to photo display mode. You can also create an empty file at `/frame/config_mode.txt`. The library does not expose a clear USB/VBUS detect pin for this board; if your hardware revision exposes one, set `USB_POWER_DETECT_PIN` near the top of the sketch so USB power automatically enters config mode.
 
