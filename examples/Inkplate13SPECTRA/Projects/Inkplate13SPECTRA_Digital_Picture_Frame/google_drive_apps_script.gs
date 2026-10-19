@@ -4,12 +4,18 @@
 // - Execute as: Me
 // - Who has access: Anyone with the link
 //
+// Before deploying, run manifestOutput once in the editor and grant Drive
+// permissions as the script owner. The final deployed /exec URL, not the
+// editor-only /dev URL, must return JSON in a private browser window without
+// any Google login or permission popup.
+//
 // The token below is checked by the script before listing or serving files.
 
 const FOLDER_ID = 'PASTE_GOOGLE_DRIVE_FOLDER_ID_HERE';
 const SYNC_TOKEN = 'CHANGE_THIS_SHARED_SECRET';
 
 const SUPPORTED_EXTENSIONS = ['.bin', '.jpg', '.jpeg', '.png', '.bmp'];
+const MAX_MANIFEST_ITEMS = 48;
 
 function doGet(e) {
   const params = e.parameter || {};
@@ -29,7 +35,7 @@ function manifestOutput() {
   const files = folder.getFiles();
   const photos = [];
 
-  while (files.hasNext()) {
+  while (files.hasNext() && photos.length < MAX_MANIFEST_ITEMS) {
     const file = files.next();
     const name = file.getName();
     if (!isSupportedName(name)) {

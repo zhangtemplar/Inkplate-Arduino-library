@@ -37,7 +37,11 @@ static const char *AP_PASSWORD = "inkplate13";
 
 static const uint16_t MAX_PHOTOS = 128;
 static const uint8_t MAX_MANIFEST_ITEMS = 48;
+static const size_t MANIFEST_JSON_CAPACITY = 65536;
+static const size_t MAX_MANIFEST_BODY_BYTES = 60000;
 static const uint32_t WIFI_TIMEOUT_MS = 20000;
+static const int32_t HTTP_CONNECT_TIMEOUT_MS = 20000;
+static const uint16_t HTTP_READ_TIMEOUT_MS = 60000;
 static const uint32_t DOWNLOAD_IDLE_TIMEOUT_MS = 15000;
 static const uint8_t PHOTO_ROTATION_PORTRAIT = 0;
 static const uint8_t PHOTO_ROTATION_LANDSCAPE = 1;
@@ -956,6 +960,37 @@ int16_t centeredOffset(uint16_t contentSize, uint16_t screenSize)
     return contentSize < screenSize ? (int16_t)((screenSize - contentSize) / 2) : 0;
 }
 
+void configureHttpClient(HTTPClient &http)
+{
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
+    http.setTimeout(HTTP_READ_TIMEOUT_MS);
+    http.setReuse(false);
+}
+
+String httpStatusText(HTTPClient &http, int code)
+{
+    if (code < 0)
+        return String(code) + " (" + http.errorToString(code) + ")";
+    return String(code);
+}
+
+void addHttpHeaders(HTTPClient &http, const char *accept)
+{
+    http.addHeader("Accept", accept);
+    http.addHeader("Accept-Encoding", "identity");
+}
+
+String compactPreview(String value, size_t maxLength)
+{
+    value.replace('\r', ' ');
+    value.replace('\n', ' ');
+    value.trim();
+    if (value.length() > maxLength)
+        value = value.substring(0, maxLength) + "...";
+    return value;
+}
+
 bool drawBinFromSd(const char *path)
 {
     SdFile file;
@@ -1049,14 +1084,15 @@ bool displayPhoto(const String &path)
 bool downloadFile(const String &url, const String &path)
 {
     HTTPClient http;
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    configureHttpClient(http);
     if (!http.begin(url))
         return false;
 
+    addHttpHeaders(http, "*/*");
     int code = http.GET();
     if (code != HTTP_CODE_OK)
     {
-        Serial.printf("Download HTTP %d: %s\n", code, url.c_str());
+        Serial.printf("Download HTTP %s: %s\n", httpStatusText(http, code).c_str(), url.c_str());
         http.end();
         return false;
     }
@@ -1173,14 +1209,15 @@ bool writeBase64Char(SdFile &out, char c, uint8_t quartet[4], uint8_t &quartetLe
 bool downloadBase64File(const String &url, const String &path)
 {
     HTTPClient http;
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    configureHttpClient(http);
     if (!http.begin(url))
         return false;
 
+    addHttpHeaders(http, "text/plain");
     int code = http.GET();
     if (code != HTTP_CODE_OK)
     {
-        Serial.printf("Base64 download HTTP %d\n", code);
+        Serial.printf("Base64 download HTTP %s\n", httpStatusText(http, code).c_str());
         http.end();
         return false;
     }
@@ -1346,7 +1383,7 @@ uint16_t syncFromDriveFolder()
     showStatus("Syncing photos", "Reading Google Drive manifest...");
 
     HTTPClient http;
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    configureHttpClient(http);
     String requestUrl = buildScriptUrl("manifest");
     if (!http.begin(requestUrl))
     {
@@ -1354,20 +1391,29 @@ uint16_t syncFromDriveFolder()
         return 0;
     }
 
+    addHttpHeaders(http, "application/json");
     int code = http.GET();
     if (code != HTTP_CODE_OK)
     {
-        lastWebMessage = "Manifest HTTP error " + String(code);
+        lastWebMessage = "Manifest HTTP error " + httpStatusText(http, code);
         http.end();
         return 0;
     }
 
-    DynamicJsonDocument doc(32768);
-    DeserializationError err = deserializeJson(doc, *http.getStreamPtr());
+    String manifestBody = http.getString();
     http.end();
+    if (manifestBody.length() > MAX_MANIFEST_BODY_BYTES)
+    {
+        lastWebMessage = "Manifest too large: " + String(manifestBody.length()) + " bytes. Limit Drive folder to " +
+                         String(MAX_MANIFEST_ITEMS) + " files.";
+        return 0;
+    }
+
+    DynamicJsonDocument doc(MANIFEST_JSON_CAPACITY);
+    DeserializationError err = deserializeJson(doc, manifestBody);
     if (err)
     {
-        lastWebMessage = "Manifest JSON parse failed.";
+        lastWebMessage = String("Manifest JSON ") + err.c_str() + ": " + compactPreview(manifestBody, 96);
         return 0;
     }
 

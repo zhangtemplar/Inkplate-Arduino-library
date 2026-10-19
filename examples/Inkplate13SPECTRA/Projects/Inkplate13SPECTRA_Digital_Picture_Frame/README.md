@@ -18,8 +18,12 @@ The frame syncs from a Google Drive folder through the included `google_drive_ap
 
 1. Create a Google Drive folder for frame photos.
 2. Open Apps Script, paste `google_drive_apps_script.gs`, and set `FOLDER_ID` plus `SYNC_TOKEN`.
-3. Deploy it as a web app with "Execute as: Me" and "Who has access: Anyone with the link".
-4. Enter the web app `/exec` URL and the same token on the frame config page.
+3. In the Apps Script editor, select `manifestOutput` and click Run once. Grant the requested Drive permissions as the script owner.
+4. Deploy it as a web app with "Execute as: Me" and "Who has access: Anyone with the link".
+5. Test the deployed `/exec` URL, not the editor-only `/dev` URL, plus `?mode=manifest&token=SECRET` in a private browser window. It must return JSON without a Google login, permission grant, or popup.
+6. Enter the web app `/exec` URL and the same token on the frame config page.
+
+If the test URL asks for Google authorization, the deployment is not usable by the Inkplate. Recheck that the web app runs as you, that access is public/link-based, and that you created a new deployment version after editing the script. Some Google Workspace domains block public Apps Script web apps; in that case use a personal Google account or a different manifest host.
 
 The Apps Script exposes:
 
@@ -28,7 +32,7 @@ The Apps Script exposes:
 ?mode=file&id=DRIVE_FILE_ID&token=SECRET
 ```
 
-The manifest includes `id`, `name`, `modified`, and `size`. The Inkplate saves `/frame/sync_state.json` and downloads only missing or changed files. The config page controls how often the frame checks Drive; set "Sync every display updates" to `1` to check on every wake.
+The manifest includes `id`, `name`, `modified`, and `size`. The Inkplate saves `/frame/sync_state.json` and downloads only missing or changed files. The config page controls how often the frame checks Drive; set "Sync every display updates" to `1` to check on every wake. Keep the Drive sync folder focused; the example processes up to 48 supported files and uses a 60 second HTTP read timeout for Apps Script cold starts.
 
 ## Config Mode
 
