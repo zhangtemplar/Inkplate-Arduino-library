@@ -39,6 +39,8 @@ static const uint16_t MAX_PHOTOS = 128;
 static const uint8_t MAX_MANIFEST_ITEMS = 48;
 static const uint32_t WIFI_TIMEOUT_MS = 20000;
 static const uint32_t DOWNLOAD_IDLE_TIMEOUT_MS = 15000;
+static const uint8_t PHOTO_ROTATION_PORTRAIT = 0;
+static const uint8_t PHOTO_ROTATION_LANDSCAPE = 1;
 
 Inkplate display;
 WebServer server(80);
@@ -57,6 +59,13 @@ struct FrameConfig
     uint16_t syncEveryUpdates;
     float lowBatteryVoltage;
     uint32_t lastIndex;
+};
+
+struct ImageDimensions
+{
+    uint16_t width;
+    uint16_t height;
+    bool valid;
 };
 
 FrameConfig config;
@@ -90,6 +99,30 @@ uint16_t readLe16(const uint8_t *p)
 uint32_t readLe32(const uint8_t *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+uint16_t readBe16(const uint8_t *p)
+{
+    return ((uint16_t)p[0] << 8) | (uint16_t)p[1];
+}
+
+uint32_t readBe32(const uint8_t *p)
+{
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+bool readByte(SdFile &file, uint8_t &value)
+{
+    return file.read(&value, 1) == 1;
+}
+
+bool readBe16(SdFile &file, uint16_t &value)
+{
+    uint8_t bytes[2];
+    if (file.read(bytes, sizeof(bytes)) != (int)sizeof(bytes))
+        return false;
+    value = readBe16(bytes);
+    return true;
 }
 
 void setDefaultConfig()
@@ -395,8 +428,14 @@ String sanitizeUploadFilename(String filename)
     return safe;
 }
 
+void setUiRotation()
+{
+    display.setRotation(PHOTO_ROTATION_LANDSCAPE);
+}
+
 void showStatus(const String &title, const String &line1 = "", const String &line2 = "", const String &line3 = "")
 {
+    setUiRotation();
     display.clearDisplay();
     display.setTextColor(INKPLATE_BLACK);
     display.setTextSize(4);
@@ -721,6 +760,202 @@ void appendFileManagerRows(String &html, const String &dirPath, uint8_t depth, u
     dir.close();
 }
 
+bool setDimensions(ImageDimensions &dimensions, uint32_t width, uint32_t height)
+{
+    if (width == 0 || height == 0 || width > 65535UL || height > 65535UL)
+        return false;
+
+    dimensions.width = (uint16_t)width;
+    dimensions.height = (uint16_t)height;
+    dimensions.valid = true;
+    return true;
+}
+
+bool readPngDimensions(const char *path, ImageDimensions &dimensions)
+{
+    SdFile file;
+    if (!file.open(path, O_RDONLY))
+        return false;
+
+    uint8_t header[24];
+    bool ok = file.read(header, sizeof(header)) == (int)sizeof(header);
+    file.close();
+    if (!ok)
+        return false;
+
+    static const uint8_t pngSignature[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    if (memcmp(header, pngSignature, sizeof(pngSignature)) != 0 || memcmp(header + 12, "IHDR", 4) != 0)
+        return false;
+
+    return setDimensions(dimensions, readBe32(header + 16), readBe32(header + 20));
+}
+
+bool readBmpDimensions(const char *path, ImageDimensions &dimensions)
+{
+    SdFile file;
+    if (!file.open(path, O_RDONLY))
+        return false;
+
+    uint8_t header[26];
+    bool ok = file.read(header, sizeof(header)) == (int)sizeof(header);
+    file.close();
+    if (!ok || header[0] != 'B' || header[1] != 'M')
+        return false;
+
+    int32_t width = (int32_t)readLe32(header + 18);
+    int32_t height = (int32_t)readLe32(header + 22);
+    if (width <= 0 || height == 0)
+        return false;
+    if (height < 0)
+        height = -height;
+
+    return setDimensions(dimensions, (uint32_t)width, (uint32_t)height);
+}
+
+bool jpegMarkerHasDimensions(uint8_t marker)
+{
+    return marker == 0xC0 || marker == 0xC1 || marker == 0xC2 || marker == 0xC3 || marker == 0xC5 ||
+           marker == 0xC6 || marker == 0xC7 || marker == 0xC9 || marker == 0xCA || marker == 0xCB ||
+           marker == 0xCD || marker == 0xCE || marker == 0xCF;
+}
+
+bool readJpegDimensions(const char *path, ImageDimensions &dimensions)
+{
+    SdFile file;
+    if (!file.open(path, O_RDONLY))
+        return false;
+
+    uint8_t first;
+    uint8_t second;
+    if (!readByte(file, first) || !readByte(file, second) || first != 0xFF || second != 0xD8)
+    {
+        file.close();
+        return false;
+    }
+
+    while (file.available())
+    {
+        uint8_t markerStart = 0;
+        do
+        {
+            if (!readByte(file, markerStart))
+            {
+                file.close();
+                return false;
+            }
+        } while (markerStart != 0xFF && file.available());
+
+        uint8_t marker = 0;
+        do
+        {
+            if (!readByte(file, marker))
+            {
+                file.close();
+                return false;
+            }
+        } while (marker == 0xFF);
+
+        if (marker == 0xD9 || marker == 0xDA)
+            break;
+        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7))
+            continue;
+
+        uint16_t segmentLength;
+        if (!readBe16(file, segmentLength) || segmentLength < 2)
+        {
+            file.close();
+            return false;
+        }
+
+        if (jpegMarkerHasDimensions(marker))
+        {
+            uint8_t precision;
+            uint8_t sizeBytes[4];
+            if (!readByte(file, precision) || file.read(sizeBytes, sizeof(sizeBytes)) != (int)sizeof(sizeBytes))
+            {
+                file.close();
+                return false;
+            }
+            (void)precision;
+            uint16_t height = readBe16(sizeBytes);
+            uint16_t width = readBe16(sizeBytes + 2);
+            file.close();
+            return setDimensions(dimensions, width, height);
+        }
+
+        if (!file.seekCur((int32_t)segmentLength - 2))
+        {
+            file.close();
+            return false;
+        }
+    }
+
+    file.close();
+    return false;
+}
+
+bool readBinDimensions(const char *path, ImageDimensions &dimensions)
+{
+    SdFile file;
+    if (!file.open(path, O_RDONLY))
+        return false;
+
+    uint8_t header[32];
+    bool ok = file.read(header, sizeof(header)) == (int)sizeof(header);
+    file.close();
+    if (!ok)
+        return false;
+
+    uint32_t expectedBytes = (uint32_t)E_INK_WIDTH * (uint32_t)E_INK_HEIGHT / 2;
+    if (memcmp(header, BIN_MAGIC, sizeof(BIN_MAGIC)) != 0 || header[8] != 1 ||
+        readLe16(header + 16) != E_INK_WIDTH || readLe16(header + 18) != E_INK_HEIGHT ||
+        readLe32(header + 20) != expectedBytes)
+    {
+        return false;
+    }
+
+    return setDimensions(dimensions, readLe16(header + 12), readLe16(header + 14));
+}
+
+bool readImageDimensions(const char *path, const String &lowerPath, ImageDimensions &dimensions)
+{
+    dimensions.width = 0;
+    dimensions.height = 0;
+    dimensions.valid = false;
+
+    if (lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg"))
+        return readJpegDimensions(path, dimensions);
+    if (lowerPath.endsWith(".png"))
+        return readPngDimensions(path, dimensions);
+    if (lowerPath.endsWith(".bmp"))
+        return readBmpDimensions(path, dimensions);
+    if (lowerPath.endsWith(".bin"))
+        return readBinDimensions(path, dimensions);
+    return false;
+}
+
+uint8_t photoRotationForDimensions(const ImageDimensions &dimensions)
+{
+    if (dimensions.valid && dimensions.height > dimensions.width)
+        return PHOTO_ROTATION_PORTRAIT;
+    return PHOTO_ROTATION_LANDSCAPE;
+}
+
+uint16_t logicalWidthForRotation(uint8_t rotation)
+{
+    return (rotation == PHOTO_ROTATION_LANDSCAPE || rotation == 3) ? E_INK_HEIGHT : E_INK_WIDTH;
+}
+
+uint16_t logicalHeightForRotation(uint8_t rotation)
+{
+    return (rotation == PHOTO_ROTATION_LANDSCAPE || rotation == 3) ? E_INK_WIDTH : E_INK_HEIGHT;
+}
+
+int16_t centeredOffset(uint16_t contentSize, uint16_t screenSize)
+{
+    return contentSize < screenSize ? (int16_t)((screenSize - contentSize) / 2) : 0;
+}
+
 bool drawBinFromSd(const char *path)
 {
     SdFile file;
@@ -765,16 +1000,24 @@ bool drawBinFromSd(const char *path)
     return true;
 }
 
-bool drawCommonImageFromSd(const char *path)
+bool drawCommonImageFromSd(const char *path, const ImageDimensions &dimensions, uint8_t rotation)
 {
     String lower(path);
     lower.toLowerCase();
+    int16_t x = 0;
+    int16_t y = 0;
+    if (dimensions.valid)
+    {
+        x = centeredOffset(dimensions.width, logicalWidthForRotation(rotation));
+        y = centeredOffset(dimensions.height, logicalHeightForRotation(rotation));
+    }
+
     if (lower.endsWith(".jpg") || lower.endsWith(".jpeg"))
-        return display.image.draw(path, ImageColor::JPG, 0, 0, true, false);
+        return display.image.draw(path, ImageColor::JPG, x, y, true, false);
     if (lower.endsWith(".png"))
-        return display.image.draw(path, ImageColor::PNG, 0, 0, true, false);
+        return display.image.draw(path, ImageColor::PNG, x, y, true, false);
     if (lower.endsWith(".bmp"))
-        return display.image.draw(path, ImageColor::BMP, 0, 0, true, false);
+        return display.image.draw(path, ImageColor::BMP, x, y, true, false);
     return false;
 }
 
@@ -783,17 +1026,23 @@ bool displayPhoto(const String &path)
     Serial.print("Displaying ");
     Serial.println(path);
 
-    display.clearDisplay();
     bool ok = false;
     String lower(path);
     lower.toLowerCase();
+    ImageDimensions dimensions;
+    readImageDimensions(path.c_str(), lower, dimensions);
+    uint8_t rotation = photoRotationForDimensions(dimensions);
+    display.setRotation(rotation);
+
+    display.clearDisplay();
     if (lower.endsWith(".bin"))
         ok = drawBinFromSd(path.c_str());
     else
-        ok = drawCommonImageFromSd(path.c_str());
+        ok = drawCommonImageFromSd(path.c_str(), dimensions, rotation);
 
     if (ok)
         display.display();
+    setUiRotation();
     return ok;
 }
 

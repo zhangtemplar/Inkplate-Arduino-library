@@ -3,7 +3,8 @@
 
 The output format starts with a 32 byte little-endian header followed by the
 native Inkplate 13SPECTRA framebuffer: 1200 x 1600 pixels, two 4-bit Spectra 6
-color indexes per byte, high nibble first.
+color indexes per byte, high nibble first. Source images can be packed as either
+1600 x 1200 landscape or 1200 x 1600 portrait logical views.
 """
 
 from __future__ import annotations
@@ -21,11 +22,15 @@ except ImportError as exc:
 
 MAGIC = b"IP13SP6B"
 VERSION = 1
-LOGICAL_WIDTH = 1600
-LOGICAL_HEIGHT = 1200
+LANDSCAPE_SIZE = (1600, 1200)
+PORTRAIT_SIZE = (1200, 1600)
 NATIVE_WIDTH = 1200
 NATIVE_HEIGHT = 1600
 DATA_BYTES = NATIVE_WIDTH * NATIVE_HEIGHT // 2
+ROTATION_BY_ORIENTATION = {
+    "portrait": 0,
+    "landscape": 1,
+}
 
 SPECTRA_PALETTE = [
     (0, 0, 0),        # 0 black
@@ -47,10 +52,22 @@ def build_palette_image() -> Image.Image:
     return pal
 
 
-def fit_image(image: Image.Image, fit: str, background: tuple[int, int, int]) -> Image.Image:
-    image = ImageOps.exif_transpose(image).convert("RGB")
-    target = (LOGICAL_WIDTH, LOGICAL_HEIGHT)
+def choose_orientation(image: Image.Image, requested: str) -> str:
+    if requested != "auto":
+        return requested
+    return "portrait" if image.height > image.width else "landscape"
 
+
+def target_size_for_orientation(orientation: str) -> tuple[int, int]:
+    return PORTRAIT_SIZE if orientation == "portrait" else LANDSCAPE_SIZE
+
+
+def fit_image(
+    image: Image.Image,
+    target: tuple[int, int],
+    fit: str,
+    background: tuple[int, int, int],
+) -> Image.Image:
     if fit == "cover":
         return ImageOps.fit(image, target, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
 
@@ -59,8 +76,8 @@ def fit_image(image: Image.Image, fit: str, background: tuple[int, int, int]) ->
 
     image.thumbnail(target, Image.Resampling.LANCZOS)
     canvas = Image.new("RGB", target, background)
-    x = (LOGICAL_WIDTH - image.width) // 2
-    y = (LOGICAL_HEIGHT - image.height) // 2
+    x = (target[0] - image.width) // 2
+    y = (target[1] - image.height) // 2
     canvas.paste(image, (x, y))
     return canvas
 
@@ -70,21 +87,29 @@ def quantize_to_spectra(image: Image.Image, dither: bool) -> Image.Image:
     return image.quantize(palette=build_palette_image(), dither=dither_mode)
 
 
-def pack_native_frame(logical: Image.Image) -> bytes:
-    """Map the 1600x1200 landscape view to the library's default rotation-1 buffer."""
+def pack_native_frame(logical: Image.Image, orientation: str) -> bytes:
+    """Map the logical view to the framebuffer used by the matching sketch rotation."""
 
     pixels = logical.load()
+    logical_width, logical_height = logical.size
     out = bytearray(DATA_BYTES)
+    rotation = ROTATION_BY_ORIENTATION[orientation]
 
-    for y in range(LOGICAL_HEIGHT):
-        for x in range(LOGICAL_WIDTH):
+    for y in range(logical_height):
+        for x in range(logical_width):
             color = pixels[x, y] & 0x0F
 
-            # Inkplate13SPECTRA initDriver() sets rotation 1. writePixel(x, y)
-            # maps logical landscape pixels to native framebuffer coordinates:
-            # native_col = y, native_row = 1599 - x.
-            native_col = y
-            native_row = LOGICAL_WIDTH - x - 1
+            if rotation == 1:
+                # Landscape uses sketch rotation 1:
+                # native_col = y, native_row = 1599 - x.
+                native_col = y
+                native_row = logical_width - x - 1
+            else:
+                # Portrait uses sketch rotation 0:
+                # native_col = 1199 - x, native_row = 1599 - y.
+                native_col = logical_width - x - 1
+                native_row = logical_height - y - 1
+
             byte_index = native_row * (NATIVE_WIDTH // 2) + native_col // 2
 
             if native_col & 1:
@@ -95,8 +120,9 @@ def pack_native_frame(logical: Image.Image) -> bytes:
     return bytes(out)
 
 
-def write_bin(output: Path, payload: bytes) -> None:
-    flags = 0x03  # native packed data, logical landscape rotation-1 mapping
+def write_bin(output: Path, payload: bytes, logical_size: tuple[int, int], orientation: str) -> None:
+    rotation = ROTATION_BY_ORIENTATION[orientation]
+    flags = 0x01 | (rotation << 1)  # native packed data plus the sketch rotation used when packing
     header = struct.pack(
         "<8sBBBBHHHHI8s",
         MAGIC,
@@ -104,8 +130,8 @@ def write_bin(output: Path, payload: bytes) -> None:
         flags,
         len(SPECTRA_PALETTE),
         0,
-        LOGICAL_WIDTH,
-        LOGICAL_HEIGHT,
+        logical_size[0],
+        logical_size[1],
         NATIVE_WIDTH,
         NATIVE_HEIGHT,
         len(payload),
@@ -129,6 +155,12 @@ def parse_args() -> argparse.Namespace:
         default="#FFFFFF",
         help="Background color for --fit contain, for example #FFFFFF.",
     )
+    parser.add_argument(
+        "--orientation",
+        choices=("auto", "landscape", "portrait"),
+        default="auto",
+        help="Output orientation. auto chooses portrait for taller source images.",
+    )
     parser.add_argument("--no-dither", action="store_true", help="Disable Floyd-Steinberg palette dithering.")
     parser.add_argument("--preview", type=Path, help="Optional PNG preview of the six-color result.")
     return parser.parse_args()
@@ -139,18 +171,20 @@ def main() -> int:
     output = args.output or args.input.with_suffix(".bin")
     background = ImageColor.getrgb(args.background)
 
-    image = Image.open(args.input)
-    fitted = fit_image(image, args.fit, background)
+    image = ImageOps.exif_transpose(Image.open(args.input)).convert("RGB")
+    orientation = choose_orientation(image, args.orientation)
+    target = target_size_for_orientation(orientation)
+    fitted = fit_image(image, target, args.fit, background)
     quantized = quantize_to_spectra(fitted, dither=not args.no_dither)
 
     if args.preview:
         args.preview.parent.mkdir(parents=True, exist_ok=True)
         quantized.convert("RGB").save(args.preview)
 
-    payload = pack_native_frame(quantized)
+    payload = pack_native_frame(quantized, orientation)
     output.parent.mkdir(parents=True, exist_ok=True)
-    write_bin(output, payload)
-    print(f"Wrote {output} ({len(payload) + 32} bytes)")
+    write_bin(output, payload, target, orientation)
+    print(f"Wrote {output} ({orientation}, {target[0]}x{target[1]}, {len(payload) + 32} bytes)")
     return 0
 
 
