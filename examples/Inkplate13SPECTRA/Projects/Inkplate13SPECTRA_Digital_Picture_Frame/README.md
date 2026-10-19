@@ -40,6 +40,8 @@ On first boot, the frame starts an access point named `Inkplate13Frame` with pas
 
 To force config mode later, press the Inkplate 13SPECTRA WAKE button while the frame is sleeping; the sketch enables GPIO18 as a config-mode wake source. While config mode is running, press WAKE again to close the web UI and return to photo display mode. You can also create an empty file at `/frame/config_mode.txt`. The library does not expose a clear USB/VBUS detect pin for this board; if your hardware revision exposes one, set `USB_POWER_DETECT_PIN` near the top of the sketch so USB power automatically enters config mode.
 
+The config page shows the tail of `/frame/sync_debug.log`. Open `/log` for the full recent sync log and `/manifest_response` for the raw response captured from the last manifest request. Tokens are redacted from logged URLs.
+
 ## File Management
 
 The config page includes an SD file manager scoped to the configured photo folder. Use it to upload `.bin`, `.jpg`, `.jpeg`, `.png`, or `.bmp` images, create subfolders, delete individual image files, and recursively delete subfolders. Photo playback scans subfolders too. Deleting the photo root itself is blocked so settings and sync state stay intact.

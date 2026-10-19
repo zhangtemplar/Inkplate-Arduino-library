@@ -31,6 +31,8 @@
 static const char *CONFIG_PATH = "/frame/config.json";
 static const char *SYNC_STATE_PATH = "/frame/sync_state.json";
 static const char *CONFIG_TRIGGER_PATH = "/frame/config_mode.txt";
+static const char *DEBUG_LOG_PATH = "/frame/sync_debug.log";
+static const char *MANIFEST_RESPONSE_PATH = "/frame/last_manifest_response.txt";
 static const char *DEFAULT_PHOTO_DIR = "/frame/photos";
 static const char *AP_SSID = "Inkplate13Frame";
 static const char *AP_PASSWORD = "inkplate13";
@@ -39,6 +41,8 @@ static const uint16_t MAX_PHOTOS = 128;
 static const uint8_t MAX_MANIFEST_ITEMS = 48;
 static const size_t MANIFEST_JSON_CAPACITY = 65536;
 static const size_t MAX_MANIFEST_BODY_BYTES = 60000;
+static const size_t MAX_DEBUG_LOG_BYTES = 24000;
+static const size_t WEB_DEBUG_PREVIEW_BYTES = 4000;
 static const uint32_t WIFI_TIMEOUT_MS = 20000;
 static const int32_t HTTP_CONNECT_TIMEOUT_MS = 20000;
 static const uint16_t HTTP_READ_TIMEOUT_MS = 60000;
@@ -86,6 +90,7 @@ uint32_t configReconnectAt = 0;
 bool configApRunning = false;
 
 static const uint8_t BIN_MAGIC[8] = {'I', 'P', '1', '3', 'S', 'P', '6', 'B'};
+static const char *HTTP_DEBUG_HEADER_KEYS[] = {"Content-Type", "Content-Length", "Location"};
 
 void copyString(char *dst, const char *src, size_t size)
 {
@@ -159,6 +164,83 @@ void ensureStorage()
     sd.mkdir("/frame", true);
     normalizePhotoDir();
     sd.mkdir(config.photoDir, true);
+}
+
+String redactUrlToken(String url)
+{
+    int tokenStart = url.indexOf("token=");
+    if (tokenStart < 0)
+        return url;
+
+    int valueStart = tokenStart + 6;
+    int valueEnd = url.indexOf('&', valueStart);
+    if (valueEnd < 0)
+        valueEnd = url.length();
+    return url.substring(0, valueStart) + "REDACTED" + url.substring(valueEnd);
+}
+
+void debugLog(const String &message)
+{
+    String line = String(millis()) + " " + message;
+    Serial.println(line);
+
+    SdFat &sd = display.getSdFat();
+    sd.mkdir("/frame", true);
+
+    SdFile existing;
+    if (existing.open(DEBUG_LOG_PATH, O_RDONLY))
+    {
+        uint32_t size = existing.fileSize();
+        existing.close();
+        if (size > MAX_DEBUG_LOG_BYTES)
+            sd.remove(DEBUG_LOG_PATH);
+    }
+
+    SdFile logFile;
+    if (logFile.open(DEBUG_LOG_PATH, O_WRONLY | O_CREAT | O_APPEND))
+    {
+        logFile.println(line);
+        logFile.close();
+    }
+}
+
+bool writeTextFile(const char *path, const String &body)
+{
+    SdFat &sd = display.getSdFat();
+    sd.remove(path);
+
+    SdFile file;
+    if (!file.open(path, O_WRONLY | O_CREAT | O_TRUNC))
+        return false;
+    file.print(body);
+    file.close();
+    return true;
+}
+
+String readTextFileTail(const char *path, size_t maxBytes)
+{
+    SdFile file;
+    if (!file.open(path, O_RDONLY))
+        return "";
+
+    uint32_t size = file.fileSize();
+    if (size > maxBytes)
+        file.seekSet(size - maxBytes);
+
+    String out;
+    char buffer[129];
+    while (file.available() && out.length() < maxBytes)
+    {
+        int toRead = min((int)sizeof(buffer) - 1, (int)(maxBytes - out.length()));
+        int got = file.read(buffer, toRead);
+        if (got <= 0)
+            break;
+        buffer[got] = '\0';
+        out += buffer;
+    }
+
+    file.close();
+    return out;
 }
 
 bool loadConfig()
@@ -966,6 +1048,7 @@ void configureHttpClient(HTTPClient &http)
     http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
     http.setTimeout(HTTP_READ_TIMEOUT_MS);
     http.setReuse(false);
+    http.collectHeaders(HTTP_DEBUG_HEADER_KEYS, 3);
 }
 
 String httpStatusText(HTTPClient &http, int code)
@@ -1083,13 +1166,19 @@ bool displayPhoto(const String &path)
 
 bool downloadFile(const String &url, const String &path)
 {
+    debugLog("Download direct start: " + path + " from " + redactUrlToken(url));
     HTTPClient http;
     configureHttpClient(http);
     if (!http.begin(url))
+    {
+        debugLog("Download direct begin failed");
         return false;
+    }
 
     addHttpHeaders(http, "*/*");
     int code = http.GET();
+    debugLog("Download direct HTTP " + httpStatusText(http, code) + ", type=" + http.header("Content-Type") +
+             ", size=" + String(http.getSize()));
     if (code != HTTP_CODE_OK)
     {
         Serial.printf("Download HTTP %s: %s\n", httpStatusText(http, code).c_str(), url.c_str());
@@ -1104,6 +1193,7 @@ bool downloadFile(const String &url, const String &path)
     SdFile out;
     if (!out.open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC))
     {
+        debugLog("Download direct SD open failed: " + tmpPath);
         http.end();
         return false;
     }
@@ -1133,6 +1223,7 @@ bool downloadFile(const String &url, const String &path)
         {
             if (millis() - lastData > DOWNLOAD_IDLE_TIMEOUT_MS)
             {
+                debugLog("Download direct idle timeout: " + path);
                 ok = false;
                 break;
             }
@@ -1145,12 +1236,15 @@ bool downloadFile(const String &url, const String &path)
 
     if (!ok || remaining > 0)
     {
+        debugLog("Download direct failed: " + path + ", remaining=" + String(remaining));
         sd.remove(tmpPath.c_str());
         return false;
     }
 
     sd.remove(path.c_str());
-    return sd.rename(tmpPath.c_str(), path.c_str());
+    bool renamed = sd.rename(tmpPath.c_str(), path.c_str());
+    debugLog(String("Download direct ") + (renamed ? "saved: " : "rename failed: ") + path);
+    return renamed;
 }
 
 int8_t base64Value(char c)
@@ -1208,13 +1302,19 @@ bool writeBase64Char(SdFile &out, char c, uint8_t quartet[4], uint8_t &quartetLe
 
 bool downloadBase64File(const String &url, const String &path)
 {
+    debugLog("Download Apps Script start: " + path + " from " + redactUrlToken(url));
     HTTPClient http;
     configureHttpClient(http);
     if (!http.begin(url))
+    {
+        debugLog("Download Apps Script begin failed");
         return false;
+    }
 
     addHttpHeaders(http, "text/plain");
     int code = http.GET();
+    debugLog("Download Apps Script HTTP " + httpStatusText(http, code) + ", type=" + http.header("Content-Type") +
+             ", size=" + String(http.getSize()));
     if (code != HTTP_CODE_OK)
     {
         Serial.printf("Base64 download HTTP %s\n", httpStatusText(http, code).c_str());
@@ -1229,6 +1329,7 @@ bool downloadBase64File(const String &url, const String &path)
     SdFile out;
     if (!out.open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC))
     {
+        debugLog("Download Apps Script SD open failed: " + tmpPath);
         http.end();
         return false;
     }
@@ -1269,6 +1370,7 @@ bool downloadBase64File(const String &url, const String &path)
         {
             if (millis() - lastData > DOWNLOAD_IDLE_TIMEOUT_MS)
             {
+                debugLog("Download Apps Script idle timeout: " + path);
                 ok = false;
                 break;
             }
@@ -1277,19 +1379,25 @@ bool downloadBase64File(const String &url, const String &path)
     }
 
     if (quartetLen != 0)
+    {
+        debugLog("Download Apps Script base64 ended mid-quartet: " + path);
         ok = false;
+    }
 
     out.close();
     http.end();
 
     if (!ok || remaining > 0)
     {
+        debugLog("Download Apps Script failed: " + path + ", remaining=" + String(remaining));
         sd.remove(tmpPath.c_str());
         return false;
     }
 
     sd.remove(path.c_str());
-    return sd.rename(tmpPath.c_str(), path.c_str());
+    bool renamed = sd.rename(tmpPath.c_str(), path.c_str());
+    debugLog(String("Download Apps Script ") + (renamed ? "saved: " : "rename failed: ") + path);
+    return renamed;
 }
 
 void loadSyncState(DynamicJsonDocument &stateDoc)
@@ -1364,48 +1472,63 @@ String filenameFromUrl(const String &url, uint16_t index)
 
 uint16_t syncFromDriveFolder()
 {
+    debugLog("Sync start");
     if (strlen(config.scriptUrl) == 0)
     {
         lastWebMessage = "No Apps Script URL configured.";
+        debugLog(lastWebMessage);
         return 0;
     }
     if (strlen(config.syncToken) == 0)
     {
         lastWebMessage = "No sync token configured.";
+        debugLog(lastWebMessage);
         return 0;
     }
     if (!connectWiFi(WIFI_TIMEOUT_MS))
     {
         lastWebMessage = "WiFi connection failed.";
+        debugLog(lastWebMessage);
         return 0;
     }
+    debugLog("WiFi connected: ip=" + WiFi.localIP().toString() + ", rssi=" + String(WiFi.RSSI()) +
+             ", ssid=" + String(config.wifiSsid));
 
     showStatus("Syncing photos", "Reading Google Drive manifest...");
 
     HTTPClient http;
     configureHttpClient(http);
     String requestUrl = buildScriptUrl("manifest");
+    debugLog("Manifest URL: " + redactUrlToken(requestUrl));
     if (!http.begin(requestUrl))
     {
         lastWebMessage = "Could not open Apps Script URL.";
+        debugLog(lastWebMessage);
         return 0;
     }
 
     addHttpHeaders(http, "application/json");
     int code = http.GET();
+    debugLog("Manifest HTTP " + httpStatusText(http, code) + ", type=" + http.header("Content-Type") +
+             ", contentLength=" + http.header("Content-Length") + ", getSize=" + String(http.getSize()));
     if (code != HTTP_CODE_OK)
     {
         lastWebMessage = "Manifest HTTP error " + httpStatusText(http, code);
+        debugLog(lastWebMessage + ", location=" + http.header("Location"));
         http.end();
         return 0;
     }
 
     String manifestBody = http.getString();
     http.end();
+    writeTextFile(MANIFEST_RESPONSE_PATH, manifestBody);
+    debugLog("Manifest body bytes=" + String(manifestBody.length()));
+    debugLog("Manifest body preview: " + compactPreview(manifestBody, 220));
     if (manifestBody.length() > MAX_MANIFEST_BODY_BYTES)
     {
         lastWebMessage = "Manifest too large: " + String(manifestBody.length()) + " bytes. Limit Drive folder to " +
-                         String(MAX_MANIFEST_ITEMS) + " files.";
+                         String((uint16_t)MAX_MANIFEST_ITEMS) + " files.";
+        debugLog(lastWebMessage);
         return 0;
     }
 
@@ -1414,8 +1537,10 @@ uint16_t syncFromDriveFolder()
     if (err)
     {
         lastWebMessage = String("Manifest JSON ") + err.c_str() + ": " + compactPreview(manifestBody, 96);
+        debugLog(lastWebMessage);
         return 0;
     }
+    debugLog("Manifest JSON parsed successfully");
 
     JsonArray photos;
     if (doc.is<JsonArray>())
@@ -1426,8 +1551,10 @@ uint16_t syncFromDriveFolder()
     if (photos.isNull())
     {
         lastWebMessage = "Manifest must be an array or contain photos[].";
+        debugLog(lastWebMessage);
         return 0;
     }
+    debugLog("Manifest photos count=" + String((uint32_t)photos.size()));
 
     ensureStorage();
     DynamicJsonDocument stateDoc(32768);
@@ -1444,11 +1571,17 @@ uint16_t syncFromDriveFolder()
     for (JsonVariant item : photos)
     {
         if (seen >= MAX_MANIFEST_ITEMS)
+        {
+            debugLog("Manifest item cap reached: " + String((uint16_t)MAX_MANIFEST_ITEMS));
             break;
+        }
         seen++;
 
         if (!item.is<JsonObject>())
+        {
+            debugLog("Manifest item " + String(seen) + " ignored: not an object");
             continue;
+        }
 
         String id = item["id"] | "";
         String url;
@@ -1460,7 +1593,13 @@ uint16_t syncFromDriveFolder()
             name = id.length() ? ("drive_" + id + ".jpg") : filenameFromUrl(url, seen);
         name = sanitizeFilename(name, seen);
         if (!hasSupportedExtension(name))
+        {
+            debugLog("Manifest item " + String(seen) + " ignored: unsupported name " + name);
             continue;
+        }
+
+        debugLog("Manifest item " + String(seen) + ": name=" + name + ", idLen=" + String(id.length()) +
+                 ", size=" + String(remoteSize) + ", modified=" + modified);
 
         String target = joinPath(config.photoDir, name);
         JsonObject oldEntry = findStateEntry(oldState, id);
@@ -1470,6 +1609,7 @@ uint16_t syncFromDriveFolder()
         if (unchanged)
         {
             skipped++;
+            debugLog("Skipped unchanged: " + target);
             recordSyncState(newState, id, name, modified, remoteSize);
             continue;
         }
@@ -1487,17 +1627,20 @@ uint16_t syncFromDriveFolder()
         if (ok && remoteSize > 0 && !localFileMatches(target, remoteSize))
         {
             display.getSdFat().remove(target.c_str());
+            debugLog("Downloaded size mismatch, removed: " + target);
             ok = false;
         }
 
         if (ok)
         {
             downloaded++;
+            debugLog("Downloaded OK: " + target);
             recordSyncState(newState, id, name, modified, remoteSize);
         }
         else
         {
             failed++;
+            debugLog("Download failed: " + target);
         }
     }
 
@@ -1505,6 +1648,7 @@ uint16_t syncFromDriveFolder()
     WiFi.mode(WIFI_OFF);
     lastWebMessage = "Downloaded " + String(downloaded) + ", skipped " + String(skipped) + ", failed " +
                      String(failed) + " of " + String(seen) + " Drive items.";
+    debugLog("Sync done: " + lastWebMessage);
     return downloaded;
 }
 
@@ -1606,6 +1750,15 @@ void handleIndex()
         html += "<br>Config AP: disabled";
     }
     html += "<br>Photos found: " + String(scanPhotos()) + "<br>" + htmlEscape(lastWebMessage) + "</div>";
+    html += "<h2>Debug</h2><div class='row'>";
+    html += "<a href='/log'>sync_debug.log</a> | <a href='/manifest_response'>last_manifest_response.txt</a>";
+    html += "<form method='POST' action='/clear_log'><button type='submit'>Clear log</button></form>";
+    String debugPreview = readTextFileTail(DEBUG_LOG_PATH, WEB_DEBUG_PREVIEW_BYTES);
+    if (debugPreview.length())
+        html += "<pre style='white-space:pre-wrap;max-height:260px;overflow:auto'>" + htmlEscape(debugPreview) + "</pre>";
+    else
+        html += "No debug log yet.";
+    html += "</div>";
     html += "<form method='POST' action='/save'>";
     html += "<label>WiFi SSID</label><input name='ssid' value='" + htmlEscape(config.wifiSsid) + "'>";
     html += "<label>WiFi password</label><input name='password' type='password' placeholder='Leave blank to keep current'>";
@@ -1649,6 +1802,33 @@ void redirectHome()
 {
     server.sendHeader("Location", "/");
     server.send(303, "text/plain", "");
+}
+
+void handleTextFile(const char *path, const char *missingMessage)
+{
+    String body = readTextFileTail(path, MAX_DEBUG_LOG_BYTES);
+    if (body.length() == 0)
+        body = missingMessage;
+    server.send(200, "text/plain", body);
+}
+
+void handleDebugLog()
+{
+    handleTextFile(DEBUG_LOG_PATH, "No debug log yet.\n");
+}
+
+void handleManifestResponse()
+{
+    handleTextFile(MANIFEST_RESPONSE_PATH, "No manifest response captured yet.\n");
+}
+
+void handleClearLog()
+{
+    SdFat &sd = display.getSdFat();
+    sd.remove(DEBUG_LOG_PATH);
+    sd.remove(MANIFEST_RESPONSE_PATH);
+    lastWebMessage = "Debug log cleared.";
+    redirectHome();
 }
 
 void handleSave()
@@ -1838,6 +2018,9 @@ void runConfigMode()
     showConfigStatus();
 
     server.on("/", HTTP_GET, handleIndex);
+    server.on("/log", HTTP_GET, handleDebugLog);
+    server.on("/manifest_response", HTTP_GET, handleManifestResponse);
+    server.on("/clear_log", HTTP_POST, handleClearLog);
     server.on("/save", HTTP_POST, handleSave);
     server.on("/sync", HTTP_POST, handleSync);
     server.on("/show", HTTP_POST, handleShow);
