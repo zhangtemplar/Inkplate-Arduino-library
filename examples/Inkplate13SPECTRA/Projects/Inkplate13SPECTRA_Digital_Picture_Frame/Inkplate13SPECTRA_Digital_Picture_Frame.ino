@@ -36,7 +36,7 @@ static const char *MANIFEST_RESPONSE_PATH = "/frame/last_manifest_response.txt";
 static const char *DEFAULT_PHOTO_DIR = "/frame/photos";
 static const char *AP_SSID = "Inkplate13Frame";
 static const char *AP_PASSWORD = "inkplate13";
-static const char *FRAME_BUILD_ID = "sync-debug-2026-10-19-3";
+static const char *FRAME_BUILD_ID = "sync-debug-2026-10-19-5";
 
 static const uint16_t MAX_PHOTOS = 128;
 static const uint8_t MAX_MANIFEST_ITEMS = 48;
@@ -96,7 +96,7 @@ bool syncInProgress = false;
 uint32_t lastLongTaskWebService = 0;
 
 static const uint8_t BIN_MAGIC[8] = {'I', 'P', '1', '3', 'S', 'P', '6', 'B'};
-static const char *HTTP_DEBUG_HEADER_KEYS[] = {"Content-Type", "Content-Length", "Location"};
+static const char *HTTP_DEBUG_HEADER_KEYS[] = {"Content-Type", "Content-Length", "Location", "Transfer-Encoding"};
 
 void copyString(char *dst, const char *src, size_t size)
 {
@@ -378,7 +378,9 @@ String buildScriptUrl(const char *mode, const String &id = "")
     url += "mode=";
     url += mode;
     url += "&token=";
-    url += urlEncode(config.syncToken);
+    String token = config.syncToken;
+    token.trim();
+    url += urlEncode(token);
     if (id.length())
     {
         url += "&id=";
@@ -1102,7 +1104,7 @@ void configureHttpClient(HTTPClient &http)
     http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
     http.setTimeout(HTTP_READ_TIMEOUT_MS);
     http.setReuse(false);
-    http.collectHeaders(HTTP_DEBUG_HEADER_KEYS, 3);
+    http.collectHeaders(HTTP_DEBUG_HEADER_KEYS, sizeof(HTTP_DEBUG_HEADER_KEYS) / sizeof(HTTP_DEBUG_HEADER_KEYS[0]));
 }
 
 String httpStatusText(HTTPClient &http, int code)
@@ -1243,7 +1245,7 @@ bool downloadFile(const String &url, const String &path)
     addHttpHeaders(http, "*/*");
     int code = http.GET();
     debugLog("Download direct HTTP " + httpStatusText(http, code) + ", type=" + http.header("Content-Type") +
-             ", size=" + String(http.getSize()));
+             ", transfer=" + http.header("Transfer-Encoding") + ", size=" + String(http.getSize()));
     if (code != HTTP_CODE_OK)
     {
         Serial.printf("Download HTTP %s: %s\n", httpStatusText(http, code).c_str(), url.c_str());
@@ -1269,7 +1271,7 @@ bool downloadFile(const String &url, const String &path)
     uint32_t lastData = millis();
     bool ok = true;
 
-    while (http.connected() && (remaining > 0 || remaining == -1))
+    while ((http.connected() || stream->available()) && (remaining > 0 || remaining == -1))
     {
         size_t available = stream->available();
         if (available)
@@ -1372,6 +1374,132 @@ bool writeBase64Char(SdFile &out, char c, uint8_t quartet[4], uint8_t &quartetLe
     return true;
 }
 
+class Base64SdDecodeStream : public Stream
+{
+  public:
+    explicit Base64SdDecodeStream(SdFile &outFile) : out(outFile)
+    {
+    }
+
+    size_t write(uint8_t value) override
+    {
+        return write(&value, 1);
+    }
+
+    size_t write(const uint8_t *buffer, size_t size) override
+    {
+        if (failed)
+        {
+            setWriteError();
+            return 0;
+        }
+
+        for (size_t i = 0; i < size; ++i)
+        {
+            if (responsePreview.length() < 96)
+            {
+                char previewChar = (char)buffer[i];
+                responsePreview += (previewChar >= 32 && previewChar <= 126) ? previewChar : '.';
+            }
+            if (base64Value((char)buffer[i]) >= 0)
+                base64Chars++;
+
+            if (!writeBase64Char(out, (char)buffer[i], quartet, quartetLen, decodedBytes))
+            {
+                inputBytes += i;
+                failed = true;
+                errorMessage = "Download Apps Script base64/write failed at body byte " + String(inputBytes) +
+                               ", char=" + String(buffer[i]) + ", preview=" + compactPreview(responsePreview, 96);
+                setWriteError();
+                return i;
+            }
+        }
+
+        inputBytes += size;
+        serviceWebServerDuringLongTask();
+        return size;
+    }
+
+    int available() override
+    {
+        return 0;
+    }
+
+    int read() override
+    {
+        return -1;
+    }
+
+    int peek() override
+    {
+        return -1;
+    }
+
+    void flush() override
+    {
+        out.sync();
+    }
+
+    bool finish(uint32_t expectedSize)
+    {
+        if (quartetLen == 0)
+            return !failed;
+
+        String stats = statsString(expectedSize);
+        if (expectedSize > 0 && decodedBytes == expectedSize)
+        {
+            debugLog("Download Apps Script ignored trailing incomplete base64 quartet" + stats);
+            quartetLen = 0;
+            return !failed;
+        }
+
+        errorMessage = "Download Apps Script base64 ended mid-quartet" + stats;
+        if (expectedSize > 0 && decodedBytes < expectedSize)
+            errorMessage += ". Response is shorter than the Drive file; check the Apps Script token/deployment.";
+        failed = true;
+        setWriteError();
+        return false;
+    }
+
+    String statsString(uint32_t expectedSize) const
+    {
+        return ", inputBytes=" + String(inputBytes) + ", base64Chars=" + String(base64Chars) +
+               ", quartetLen=" + String(quartetLen) + ", decodedBytes=" + String(decodedBytes) +
+               ", expected=" + String(expectedSize) + ", preview=" + compactPreview(responsePreview, 96);
+    }
+
+    uint32_t inputSize() const
+    {
+        return inputBytes;
+    }
+
+    uint32_t base64CharCount() const
+    {
+        return base64Chars;
+    }
+
+    uint32_t decodedSize() const
+    {
+        return decodedBytes;
+    }
+
+    const String &error() const
+    {
+        return errorMessage;
+    }
+
+  private:
+    SdFile &out;
+    uint8_t quartet[4] = {0};
+    uint8_t quartetLen = 0;
+    uint32_t inputBytes = 0;
+    uint32_t base64Chars = 0;
+    uint32_t decodedBytes = 0;
+    String responsePreview;
+    String errorMessage;
+    bool failed = false;
+};
+
 bool downloadBase64File(const String &url, const String &path, uint32_t expectedSize, uint32_t &decodedSize)
 {
     decodedSize = 0;
@@ -1389,8 +1517,9 @@ bool downloadBase64File(const String &url, const String &path, uint32_t expected
     addHttpHeaders(http, "text/plain");
     int code = http.GET();
     String contentType = http.header("Content-Type");
+    String transferEncoding = http.header("Transfer-Encoding");
     debugLog("Download Apps Script HTTP " + httpStatusText(http, code) + ", type=" + contentType +
-             ", size=" + String(http.getSize()));
+             ", transfer=" + transferEncoding + ", size=" + String(http.getSize()));
     if (code != HTTP_CODE_OK)
     {
         setDownloadError("Download Apps Script HTTP failed: " + httpStatusText(http, code));
@@ -1421,73 +1550,36 @@ bool downloadBase64File(const String &url, const String &path, uint32_t expected
         return false;
     }
 
-    WiFiClient *stream = http.getStreamPtr();
-    int32_t remaining = http.getSize();
-    uint8_t input[2048];
-    uint8_t quartet[4] = {0};
-    uint8_t quartetLen = 0;
-    uint32_t inputBytes = 0;
-    uint32_t decodedBytes = 0;
-    uint32_t lastData = millis();
-    bool ok = true;
-
-    while (http.connected() && (remaining > 0 || remaining == -1))
-    {
-        size_t available = stream->available();
-        if (available)
-        {
-            size_t toRead = available > sizeof(input) ? sizeof(input) : available;
-            int got = stream->readBytes(input, toRead);
-            if (got > 0)
-            {
-                for (int i = 0; i < got; ++i)
-                {
-                    if (!writeBase64Char(out, (char)input[i], quartet, quartetLen, decodedBytes))
-                    {
-                        setDownloadError("Download Apps Script base64/write failed at input byte " +
-                                         String(inputBytes + i) + ", char=" + String((uint8_t)input[i]));
-                        ok = false;
-                        break;
-                    }
-                }
-                inputBytes += got;
-                if (!ok)
-                    break;
-                if (remaining > 0)
-                    remaining -= got;
-                lastData = millis();
-                serviceWebServerDuringLongTask();
-            }
-        }
-        else
-        {
-            if (millis() - lastData > DOWNLOAD_IDLE_TIMEOUT_MS)
-            {
-                setDownloadError("Download Apps Script idle timeout: " + path);
-                ok = false;
-                break;
-            }
-            serviceWebServerDuringLongTask();
-            delay(2);
-        }
-    }
-
-    if (quartetLen != 0)
-    {
-        setDownloadError("Download Apps Script base64 ended mid-quartet: " + path);
-        ok = false;
-    }
+    Base64SdDecodeStream decoder(out);
+    int bodyBytes = http.writeToStream(&decoder);
+    bool ok = decoder.finish(expectedSize);
 
     out.close();
     http.end();
+    uint32_t decodedBytes = decoder.decodedSize();
     decodedSize = decodedBytes;
-    debugLog("Download Apps Script stream done: inputBytes=" + String(inputBytes) +
-             ", decodedBytes=" + String(decodedBytes) + ", remaining=" + String(remaining));
+    debugLog("Download Apps Script stream done: bodyBytes=" + String(bodyBytes) +
+             ", inputBytes=" + String(decoder.inputSize()) + ", base64Chars=" + String(decoder.base64CharCount()) +
+             ", decodedBytes=" + String(decodedBytes));
 
-    if (!ok || remaining > 0)
+    if (bodyBytes < 0)
+    {
+        if (decoder.error().length())
+            setDownloadError(decoder.error() + ", path=" + path);
+        else
+            setDownloadError("Download Apps Script stream failed: " + httpStatusText(http, bodyBytes) +
+                             ", path=" + path);
+        ok = false;
+    }
+    else if (!ok && decoder.error().length())
+    {
+        setDownloadError(decoder.error() + ", path=" + path);
+    }
+
+    if (!ok)
     {
         if (lastDownloadError.length() == 0)
-            setDownloadError("Download Apps Script failed: " + path + ", remaining=" + String(remaining));
+            setDownloadError("Download Apps Script failed: " + path);
         sd.remove(tmpPath.c_str());
         return false;
     }
@@ -1658,7 +1750,8 @@ uint16_t syncFromDriveFolder()
     addHttpHeaders(http, "application/json");
     int code = http.GET();
     debugLog("Manifest HTTP " + httpStatusText(http, code) + ", type=" + http.header("Content-Type") +
-             ", contentLength=" + http.header("Content-Length") + ", getSize=" + String(http.getSize()));
+             ", transfer=" + http.header("Transfer-Encoding") + ", contentLength=" + http.header("Content-Length") +
+             ", getSize=" + String(http.getSize()));
     if (code != HTTP_CODE_OK)
     {
         lastWebMessage = "Manifest HTTP error " + httpStatusText(http, code);
