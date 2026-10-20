@@ -36,7 +36,7 @@ static const char *MANIFEST_RESPONSE_PATH = "/frame/last_manifest_response.txt";
 static const char *DEFAULT_PHOTO_DIR = "/frame/photos";
 static const char *AP_SSID = "Inkplate13Frame";
 static const char *AP_PASSWORD = "inkplate13";
-static const char *FRAME_BUILD_ID = "sync-debug-2026-10-19-5";
+static const char *FRAME_BUILD_ID = "sync-debug-2026-10-19-7";
 
 static const uint16_t MAX_PHOTOS = 128;
 static const uint8_t MAX_MANIFEST_ITEMS = 48;
@@ -48,6 +48,8 @@ static const uint32_t WIFI_TIMEOUT_MS = 20000;
 static const int32_t HTTP_CONNECT_TIMEOUT_MS = 20000;
 static const uint16_t HTTP_READ_TIMEOUT_MS = 60000;
 static const uint32_t DOWNLOAD_IDLE_TIMEOUT_MS = 15000;
+static const uint32_t SD_DOWNLOAD_MARGIN_BYTES = 262144;
+static const size_t DECODED_WRITE_BUFFER_BYTES = 8192;
 static const uint8_t PHOTO_ROTATION_PORTRAIT = 0;
 static const uint8_t PHOTO_ROTATION_LANDSCAPE = 1;
 
@@ -253,6 +255,30 @@ String readTextFileTail(const char *path, size_t maxBytes)
 
     file.close();
     return out;
+}
+
+String formatBytes(uint64_t bytes)
+{
+    return String((double)bytes / (1024.0 * 1024.0), 2) + " MB";
+}
+
+bool sdFreeBytes(uint64_t &freeBytes)
+{
+    SdFat &sd = display.getSdFat();
+    uint32_t clusters = sd.freeClusterCount();
+    uint32_t bytesPerCluster = sd.bytesPerCluster();
+    freeBytes = (uint64_t)clusters * (uint64_t)bytesPerCluster;
+    return bytesPerCluster > 0;
+}
+
+bool sdFileSize(const String &path, uint32_t &actualSize)
+{
+    SdFile file;
+    if (!file.open(path.c_str(), O_RDONLY))
+        return false;
+    actualSize = file.fileSize();
+    file.close();
+    return true;
 }
 
 bool loadConfig()
@@ -1335,13 +1361,19 @@ int8_t base64Value(char c)
     return -1;
 }
 
-bool writeBase64Char(SdFile &out, char c, uint8_t quartet[4], uint8_t &quartetLen, uint32_t &decodedBytes)
+bool decodeBase64Char(char c, uint8_t quartet[4], uint8_t &quartetLen, uint8_t decoded[3], uint8_t &decodedCount,
+                      const char **failureReason)
 {
+    decodedCount = 0;
     int8_t value = base64Value(c);
     if (value == -2)
         return true;
     if (value < 0)
+    {
+        if (failureReason)
+            *failureReason = "invalid base64 character";
         return false;
+    }
 
     quartet[quartetLen++] = value;
     if (quartetLen < 4)
@@ -1350,6 +1382,8 @@ bool writeBase64Char(SdFile &out, char c, uint8_t quartet[4], uint8_t &quartetLe
     if (quartet[0] == 64 || quartet[1] == 64 || (quartet[2] == 64 && quartet[3] != 64))
     {
         quartetLen = 0;
+        if (failureReason)
+            *failureReason = "invalid base64 padding";
         return false;
     }
 
@@ -1364,12 +1398,7 @@ bool writeBase64Char(SdFile &out, char c, uint8_t quartet[4], uint8_t &quartetLe
     else if (quartet[3] == 64)
         count = 2;
 
-    if (out.write(decoded, count) != count)
-    {
-        quartetLen = 0;
-        return false;
-    }
-    decodedBytes += count;
+    decodedCount = count;
     quartetLen = 0;
     return true;
 }
@@ -1379,6 +1408,19 @@ class Base64SdDecodeStream : public Stream
   public:
     explicit Base64SdDecodeStream(SdFile &outFile) : out(outFile)
     {
+        decodedBuffer = (uint8_t *)malloc(DECODED_WRITE_BUFFER_BYTES);
+        if (!decodedBuffer)
+        {
+            failed = true;
+            errorMessage = "Download Apps Script could not allocate decoded write buffer";
+            setWriteError();
+        }
+    }
+
+    ~Base64SdDecodeStream()
+    {
+        if (decodedBuffer)
+            free(decodedBuffer);
     }
 
     size_t write(uint8_t value) override
@@ -1404,12 +1446,24 @@ class Base64SdDecodeStream : public Stream
             if (base64Value((char)buffer[i]) >= 0)
                 base64Chars++;
 
-            if (!writeBase64Char(out, (char)buffer[i], quartet, quartetLen, decodedBytes))
+            const char *failureReason = "base64 decode failed";
+            uint8_t decoded[3];
+            uint8_t decodedCount = 0;
+            if (!decodeBase64Char((char)buffer[i], quartet, quartetLen, decoded, decodedCount, &failureReason))
             {
                 inputBytes += i;
                 failed = true;
-                errorMessage = "Download Apps Script base64/write failed at body byte " + String(inputBytes) +
-                               ", char=" + String(buffer[i]) + ", preview=" + compactPreview(responsePreview, 96);
+                errorMessage = "Download Apps Script " + String(failureReason) + " at body byte " +
+                               String(inputBytes) + ", char=" + String(buffer[i]) +
+                               ", decodedBytes=" + String(decodedBytes) +
+                               ", preview=" + compactPreview(responsePreview, 96);
+                setWriteError();
+                return i;
+            }
+            if (decodedCount > 0 && !appendDecoded(decoded, decodedCount))
+            {
+                inputBytes += i;
+                failed = true;
                 setWriteError();
                 return i;
             }
@@ -1437,19 +1491,31 @@ class Base64SdDecodeStream : public Stream
 
     void flush() override
     {
-        out.sync();
+        if (flushDecodedBuffer())
+            out.sync();
     }
 
     bool finish(uint32_t expectedSize)
     {
+        if (failed)
+            return false;
+
         if (quartetLen == 0)
+        {
+            if (!flushDecodedBuffer())
+                return false;
+            out.sync();
             return !failed;
+        }
 
         String stats = statsString(expectedSize);
         if (expectedSize > 0 && decodedBytes == expectedSize)
         {
             debugLog("Download Apps Script ignored trailing incomplete base64 quartet" + stats);
             quartetLen = 0;
+            if (!flushDecodedBuffer())
+                return false;
+            out.sync();
             return !failed;
         }
 
@@ -1483,18 +1549,62 @@ class Base64SdDecodeStream : public Stream
         return decodedBytes;
     }
 
+    uint32_t flushCount() const
+    {
+        return decodedFlushCount;
+    }
+
     const String &error() const
     {
         return errorMessage;
     }
 
   private:
+    bool appendDecoded(const uint8_t *decoded, uint8_t count)
+    {
+        if (!decodedBuffer)
+            return false;
+        if (decodedBufferLen + count > DECODED_WRITE_BUFFER_BYTES && !flushDecodedBuffer())
+            return false;
+
+        memcpy(decodedBuffer + decodedBufferLen, decoded, count);
+        decodedBufferLen += count;
+        decodedBytes += count;
+        return true;
+    }
+
+    bool flushDecodedBuffer()
+    {
+        if (failed)
+            return false;
+        if (decodedBufferLen == 0)
+            return true;
+
+        size_t writeStart = decodedBytes - decodedBufferLen;
+        size_t written = out.write(decodedBuffer, decodedBufferLen);
+        if (written != decodedBufferLen)
+        {
+            failed = true;
+            errorMessage = "Download Apps Script SD buffered write failed at decoded byte " + String(writeStart) +
+                           ", flushBytes=" + String(decodedBufferLen) + ", wrote=" + String(written);
+            setWriteError();
+            return false;
+        }
+
+        decodedFlushCount++;
+        decodedBufferLen = 0;
+        return true;
+    }
+
     SdFile &out;
+    uint8_t *decodedBuffer = nullptr;
+    size_t decodedBufferLen = 0;
     uint8_t quartet[4] = {0};
     uint8_t quartetLen = 0;
     uint32_t inputBytes = 0;
     uint32_t base64Chars = 0;
     uint32_t decodedBytes = 0;
+    uint32_t decodedFlushCount = 0;
     String responsePreview;
     String errorMessage;
     bool failed = false;
@@ -1540,6 +1650,42 @@ bool downloadBase64File(const String &url, const String &path, uint32_t expected
 
     String tmpPath = path + ".tmp";
     SdFat &sd = display.getSdFat();
+    uint32_t staleTmpSize = 0;
+    if (sdFileSize(tmpPath, staleTmpSize))
+    {
+        sd.remove(tmpPath.c_str());
+        debugLog("Download Apps Script removed stale temp file: " + tmpPath + ", size=" + String(staleTmpSize));
+    }
+    uint64_t freeBefore = 0;
+    bool freeKnown = sdFreeBytes(freeBefore);
+    uint32_t existingTargetSize = 0;
+    bool targetExists = sdFileSize(path, existingTargetSize);
+    if (freeKnown && expectedSize > 0)
+    {
+        uint64_t requiredBytes = (uint64_t)expectedSize + SD_DOWNLOAD_MARGIN_BYTES;
+        debugLog("Download Apps Script SD space: free=" + formatBytes(freeBefore) +
+                 ", required=" + formatBytes(requiredBytes) + ", existingTarget=" +
+                 (targetExists ? formatBytes(existingTargetSize) : String("none")));
+        if (freeBefore < requiredBytes)
+        {
+            if (targetExists && freeBefore + existingTargetSize >= requiredBytes)
+            {
+                debugLog("Download Apps Script removing stale target before download to free space: " + path +
+                         ", existingSize=" + String(existingTargetSize));
+                sd.remove(path.c_str());
+                if (sdFreeBytes(freeBefore))
+                    debugLog("Download Apps Script SD free after stale target removal: " + formatBytes(freeBefore));
+            }
+
+            if (freeBefore < requiredBytes)
+            {
+                setDownloadError("Insufficient SD space for Apps Script download: free=" + formatBytes(freeBefore) +
+                                 ", required=" + formatBytes(requiredBytes) + ", path=" + path);
+                http.end();
+                return false;
+            }
+        }
+    }
     sd.remove(tmpPath.c_str());
 
     SdFile out;
@@ -1560,7 +1706,7 @@ bool downloadBase64File(const String &url, const String &path, uint32_t expected
     decodedSize = decodedBytes;
     debugLog("Download Apps Script stream done: bodyBytes=" + String(bodyBytes) +
              ", inputBytes=" + String(decoder.inputSize()) + ", base64Chars=" + String(decoder.base64CharCount()) +
-             ", decodedBytes=" + String(decodedBytes));
+             ", decodedBytes=" + String(decodedBytes) + ", sdFlushes=" + String(decoder.flushCount()));
 
     if (bodyBytes < 0)
     {
@@ -1578,6 +1724,10 @@ bool downloadBase64File(const String &url, const String &path, uint32_t expected
 
     if (!ok)
     {
+        uint64_t freeAfterFailure = 0;
+        if (sdFreeBytes(freeAfterFailure))
+            debugLog("Download Apps Script failure SD space: free=" + formatBytes(freeAfterFailure) +
+                     ", decodedBytes=" + String(decodedBytes));
         if (lastDownloadError.length() == 0)
             setDownloadError("Download Apps Script failed: " + path);
         sd.remove(tmpPath.c_str());
@@ -1663,12 +1813,7 @@ JsonObject findStateEntry(JsonArray statePhotos, const String &id)
 
 bool localFileSize(const String &path, uint32_t &actualSize)
 {
-    SdFile file;
-    if (!file.open(path.c_str(), O_RDONLY))
-        return false;
-    actualSize = file.fileSize();
-    file.close();
-    return true;
+    return sdFileSize(path, actualSize);
 }
 
 bool localFileMatches(const String &path, uint32_t expectedSize)
