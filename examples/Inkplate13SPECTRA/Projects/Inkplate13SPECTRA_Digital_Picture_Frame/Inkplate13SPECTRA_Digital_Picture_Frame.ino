@@ -1305,8 +1305,9 @@ bool writeBase64Char(SdFile &out, char c, uint8_t quartet[4], uint8_t &quartetLe
     return true;
 }
 
-bool downloadBase64File(const String &url, const String &path, uint32_t expectedSize)
+bool downloadBase64File(const String &url, const String &path, uint32_t expectedSize, uint32_t &decodedSize)
 {
+    decodedSize = 0;
     debugLog("Download Apps Script start: " + path + ", expected=" + String(expectedSize) + " from " +
              redactUrlToken(url));
     HTTPClient http;
@@ -1408,6 +1409,7 @@ bool downloadBase64File(const String &url, const String &path, uint32_t expected
 
     out.close();
     http.end();
+    decodedSize = decodedBytes;
     debugLog("Download Apps Script stream done: inputBytes=" + String(inputBytes) +
              ", decodedBytes=" + String(decodedBytes) + ", remaining=" + String(remaining));
 
@@ -1419,10 +1421,8 @@ bool downloadBase64File(const String &url, const String &path, uint32_t expected
     }
     if (expectedSize > 0 && decodedBytes != expectedSize)
     {
-        debugLog("Download Apps Script decoded size mismatch: expected=" + String(expectedSize) +
-                 ", decoded=" + String(decodedBytes));
-        sd.remove(tmpPath.c_str());
-        return false;
+        debugLog("Download Apps Script decoded size differs from Drive metadata: expected=" + String(expectedSize) +
+                 ", decoded=" + String(decodedBytes) + ". Keeping decoded file.");
     }
 
     sd.remove(path.c_str());
@@ -1495,13 +1495,23 @@ bool stateMatches(JsonObject state, const String &name, const String &modified, 
            ((uint32_t)(state["size"] | 0)) == size;
 }
 
-void recordSyncState(JsonArray statePhotos, const String &id, const String &name, const String &modified, uint32_t size)
+uint32_t stateLocalSize(JsonObject state, uint32_t fallbackSize)
+{
+    if (state.isNull())
+        return fallbackSize;
+    uint32_t localSize = state["local_size"] | 0;
+    return localSize > 0 ? localSize : fallbackSize;
+}
+
+void recordSyncState(JsonArray statePhotos, const String &id, const String &name, const String &modified, uint32_t size,
+                     uint32_t localSize)
 {
     JsonObject item = statePhotos.createNestedObject();
     item["id"] = id;
     item["name"] = name;
     item["modified"] = modified;
     item["size"] = size;
+    item["local_size"] = localSize;
 }
 
 String filenameFromUrl(const String &url, uint16_t index)
@@ -1642,14 +1652,15 @@ uint16_t syncFromDriveFolder()
 
         String target = joinPath(config.photoDir, name);
         JsonObject oldEntry = findStateEntry(oldState, id);
-        bool unchanged = id.length() > 0 && remoteSize > 0 && localFileMatches(target, remoteSize) &&
+        uint32_t expectedLocalSize = stateLocalSize(oldEntry, remoteSize);
+        bool unchanged = id.length() > 0 && expectedLocalSize > 0 && localFileMatches(target, expectedLocalSize) &&
                          stateMatches(oldEntry, name, modified, remoteSize);
 
         if (unchanged)
         {
             skipped++;
             debugLog("Skipped unchanged: " + target);
-            recordSyncState(newState, id, name, modified, remoteSize);
+            recordSyncState(newState, id, name, modified, remoteSize, expectedLocalSize);
             continue;
         }
 
@@ -1657,27 +1668,37 @@ uint16_t syncFromDriveFolder()
                    String(downloaded) + " saved, " + String(skipped) + " unchanged");
 
         bool ok = false;
+        bool usedAppsScriptDownload = false;
+        uint32_t savedSize = 0;
         url = item["url"] | "";
         if (url.length())
-            ok = downloadFile(url, target);
-        else if (id.length())
-            ok = downloadBase64File(buildScriptUrl("file", id), target, remoteSize);
-
-        if (ok && remoteSize > 0 && !localFileMatches(target, remoteSize))
         {
-            uint32_t actualSize = 0;
-            localFileSize(target, actualSize);
+            ok = downloadFile(url, target);
+            if (ok)
+                localFileSize(target, savedSize);
+        }
+        else if (id.length())
+        {
+            usedAppsScriptDownload = true;
+            ok = downloadBase64File(buildScriptUrl("file", id), target, remoteSize, savedSize);
+        }
+
+        if (ok && remoteSize > 0 && !usedAppsScriptDownload && savedSize != remoteSize)
+        {
             display.getSdFat().remove(target.c_str());
             debugLog("Downloaded size mismatch, removed: " + target + ", expected=" + String(remoteSize) +
-                     ", actual=" + String(actualSize));
+                     ", actual=" + String(savedSize));
             ok = false;
         }
 
         if (ok)
         {
+            if (savedSize == 0)
+                localFileSize(target, savedSize);
             downloaded++;
-            debugLog("Downloaded OK: " + target);
-            recordSyncState(newState, id, name, modified, remoteSize);
+            debugLog("Downloaded OK: " + target + ", localSize=" + String(savedSize) +
+                     ", driveSize=" + String(remoteSize));
+            recordSyncState(newState, id, name, modified, remoteSize, savedSize);
         }
         else
         {
