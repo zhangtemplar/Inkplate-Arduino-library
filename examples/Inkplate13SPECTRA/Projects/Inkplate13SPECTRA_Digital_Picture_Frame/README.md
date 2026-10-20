@@ -40,7 +40,9 @@ On first boot, the frame starts an access point named `Inkplate13Frame` with pas
 
 To force config mode later, press the Inkplate 13SPECTRA WAKE button while the frame is sleeping; the sketch enables GPIO18 as a config-mode wake source. While config mode is running, press WAKE again to close the web UI and return to photo display mode. You can also create an empty file at `/frame/config_mode.txt`. The library does not expose a clear USB/VBUS detect pin for this board; if your hardware revision exposes one, set `USB_POWER_DETECT_PIN` near the top of the sketch so USB power automatically enters config mode.
 
-The config page shows the tail of `/frame/sync_debug.log`. Open `/log` for the full recent sync log and `/manifest_response` for the raw response captured from the last manifest request. Tokens are redacted from logged URLs.
+The config page shows the tail of `/frame/sync_debug.log`, and the same debug lines are printed to Serial at 115200 baud. Open `/log` for the full recent sync log and `/manifest_response` for the raw response captured from the last manifest request. Tokens are redacted from logged URLs. The "Sync photos now" button queues sync and returns immediately; while sync runs, `/log` remains available and SD-mutating commands are rejected until sync completes.
+
+In normal frame mode, the sketch displays a local photo first, then runs scheduled sync with that photo left on the e-paper panel. If no local photos exist yet, it may sync before the first photo display.
 
 ## File Management
 

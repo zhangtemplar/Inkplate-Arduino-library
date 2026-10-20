@@ -36,6 +36,7 @@ static const char *MANIFEST_RESPONSE_PATH = "/frame/last_manifest_response.txt";
 static const char *DEFAULT_PHOTO_DIR = "/frame/photos";
 static const char *AP_SSID = "Inkplate13Frame";
 static const char *AP_PASSWORD = "inkplate13";
+static const char *FRAME_BUILD_ID = "sync-debug-2026-10-19-3";
 
 static const uint16_t MAX_PHOTOS = 128;
 static const uint8_t MAX_MANIFEST_ITEMS = 48;
@@ -84,10 +85,15 @@ SdFile uploadFile;
 String uploadFinalPath;
 String uploadTempPath;
 String uploadResultMessage;
+String lastDownloadError;
 bool uploadOk = false;
 bool configReconnectPending = false;
 uint32_t configReconnectAt = 0;
 bool configApRunning = false;
+bool configModeRunning = false;
+bool configSyncPending = false;
+bool syncInProgress = false;
+uint32_t lastLongTaskWebService = 0;
 
 static const uint8_t BIN_MAGIC[8] = {'I', 'P', '1', '3', 'S', 'P', '6', 'B'};
 static const char *HTTP_DEBUG_HEADER_KEYS[] = {"Content-Type", "Content-Length", "Location"};
@@ -202,6 +208,12 @@ void debugLog(const String &message)
         logFile.println(line);
         logFile.close();
     }
+}
+
+void setDownloadError(const String &message)
+{
+    lastDownloadError = message;
+    debugLog(message);
 }
 
 bool writeTextFile(const char *path, const String &body)
@@ -382,6 +394,48 @@ String joinPath(const char *dir, const String &name)
         path += "/";
     path += name;
     return path;
+}
+
+bool copySdFile(const String &fromPath, const String &toPath, uint32_t &copiedBytes)
+{
+    copiedBytes = 0;
+    SdFat &sd = display.getSdFat();
+    SdFile in;
+    if (!in.open(fromPath.c_str(), O_RDONLY))
+        return false;
+
+    SdFile out;
+    sd.remove(toPath.c_str());
+    if (!out.open(toPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC))
+    {
+        in.close();
+        return false;
+    }
+
+    uint8_t buffer[2048];
+    bool ok = true;
+    while (in.available())
+    {
+        int got = in.read(buffer, sizeof(buffer));
+        if (got <= 0)
+        {
+            ok = false;
+            break;
+        }
+        if (out.write(buffer, got) != (size_t)got)
+        {
+            ok = false;
+            break;
+        }
+        copiedBytes += got;
+        serviceWebServerDuringLongTask();
+    }
+
+    out.close();
+    in.close();
+    if (!ok)
+        sd.remove(toPath.c_str());
+    return ok;
 }
 
 String photoRoot()
@@ -573,7 +627,7 @@ bool connectWiFi(uint32_t timeoutMs)
     if (WiFi.status() == WL_CONNECTED)
         return true;
 
-    WiFi.mode(WIFI_STA);
+    WiFi.mode(configModeRunning && configApRunning ? WIFI_AP_STA : WIFI_STA);
     WiFi.begin(config.wifiSsid, config.wifiPassword);
 
     uint32_t start = millis();
@@ -1074,6 +1128,17 @@ String compactPreview(String value, size_t maxLength)
     return value;
 }
 
+void serviceWebServerDuringLongTask()
+{
+    if (!configModeRunning)
+        return;
+    if (millis() - lastLongTaskWebService < 25)
+        return;
+
+    server.handleClient();
+    lastLongTaskWebService = millis();
+}
+
 bool drawBinFromSd(const char *path)
 {
     SdFile file;
@@ -1217,6 +1282,7 @@ bool downloadFile(const String &url, const String &path)
                 if (remaining > 0)
                     remaining -= got;
                 lastData = millis();
+                serviceWebServerDuringLongTask();
             }
         }
         else
@@ -1227,6 +1293,7 @@ bool downloadFile(const String &url, const String &path)
                 ok = false;
                 break;
             }
+            serviceWebServerDuringLongTask();
             delay(2);
         }
     }
@@ -1308,13 +1375,14 @@ bool writeBase64Char(SdFile &out, char c, uint8_t quartet[4], uint8_t &quartetLe
 bool downloadBase64File(const String &url, const String &path, uint32_t expectedSize, uint32_t &decodedSize)
 {
     decodedSize = 0;
+    lastDownloadError = "";
     debugLog("Download Apps Script start: " + path + ", expected=" + String(expectedSize) + " from " +
              redactUrlToken(url));
     HTTPClient http;
     configureHttpClient(http);
     if (!http.begin(url))
     {
-        debugLog("Download Apps Script begin failed");
+        setDownloadError("Download Apps Script begin failed");
         return false;
     }
 
@@ -1325,6 +1393,7 @@ bool downloadBase64File(const String &url, const String &path, uint32_t expected
              ", size=" + String(http.getSize()));
     if (code != HTTP_CODE_OK)
     {
+        setDownloadError("Download Apps Script HTTP failed: " + httpStatusText(http, code));
         Serial.printf("Base64 download HTTP %s\n", httpStatusText(http, code).c_str());
         http.end();
         return false;
@@ -1335,7 +1404,7 @@ bool downloadBase64File(const String &url, const String &path, uint32_t expected
     if (lowerContentType.indexOf("json") >= 0 || lowerContentType.indexOf("html") >= 0)
     {
         String response = http.getString();
-        debugLog("Download Apps Script returned non-base64 response: " + compactPreview(response, 220));
+        setDownloadError("Download Apps Script returned non-base64 response: " + compactPreview(response, 220));
         http.end();
         return false;
     }
@@ -1347,7 +1416,7 @@ bool downloadBase64File(const String &url, const String &path, uint32_t expected
     SdFile out;
     if (!out.open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_TRUNC))
     {
-        debugLog("Download Apps Script SD open failed: " + tmpPath);
+        setDownloadError("Download Apps Script SD open failed: " + tmpPath);
         http.end();
         return false;
     }
@@ -1375,8 +1444,8 @@ bool downloadBase64File(const String &url, const String &path, uint32_t expected
                 {
                     if (!writeBase64Char(out, (char)input[i], quartet, quartetLen, decodedBytes))
                     {
-                        debugLog("Download Apps Script base64/write failed at input byte " + String(inputBytes + i) +
-                                 ", char=" + String((uint8_t)input[i]));
+                        setDownloadError("Download Apps Script base64/write failed at input byte " +
+                                         String(inputBytes + i) + ", char=" + String((uint8_t)input[i]));
                         ok = false;
                         break;
                     }
@@ -1387,23 +1456,25 @@ bool downloadBase64File(const String &url, const String &path, uint32_t expected
                 if (remaining > 0)
                     remaining -= got;
                 lastData = millis();
+                serviceWebServerDuringLongTask();
             }
         }
         else
         {
             if (millis() - lastData > DOWNLOAD_IDLE_TIMEOUT_MS)
             {
-                debugLog("Download Apps Script idle timeout: " + path);
+                setDownloadError("Download Apps Script idle timeout: " + path);
                 ok = false;
                 break;
             }
+            serviceWebServerDuringLongTask();
             delay(2);
         }
     }
 
     if (quartetLen != 0)
     {
-        debugLog("Download Apps Script base64 ended mid-quartet: " + path);
+        setDownloadError("Download Apps Script base64 ended mid-quartet: " + path);
         ok = false;
     }
 
@@ -1415,7 +1486,8 @@ bool downloadBase64File(const String &url, const String &path, uint32_t expected
 
     if (!ok || remaining > 0)
     {
-        debugLog("Download Apps Script failed: " + path + ", remaining=" + String(remaining));
+        if (lastDownloadError.length() == 0)
+            setDownloadError("Download Apps Script failed: " + path + ", remaining=" + String(remaining));
         sd.remove(tmpPath.c_str());
         return false;
     }
@@ -1427,7 +1499,35 @@ bool downloadBase64File(const String &url, const String &path, uint32_t expected
 
     sd.remove(path.c_str());
     bool renamed = sd.rename(tmpPath.c_str(), path.c_str());
-    debugLog(String("Download Apps Script ") + (renamed ? "saved: " : "rename failed: ") + path);
+    if (!renamed)
+    {
+        uint32_t tmpSize = 0;
+        SdFile tmpInfo;
+        if (tmpInfo.open(tmpPath.c_str(), O_RDONLY))
+        {
+            tmpSize = tmpInfo.fileSize();
+            tmpInfo.close();
+        }
+        debugLog("Download Apps Script rename failed, trying copy fallback: " + tmpPath + " -> " + path +
+                 ", tmpSize=" + String(tmpSize));
+        uint32_t copiedBytes = 0;
+        bool copied = copySdFile(tmpPath, path, copiedBytes);
+        if (copied && copiedBytes == decodedBytes)
+        {
+            sd.remove(tmpPath.c_str());
+            debugLog("Download Apps Script saved with copy fallback: " + path + ", copied=" + String(copiedBytes));
+            return true;
+        }
+
+        sd.remove(path.c_str());
+        setDownloadError("Download Apps Script rename/copy failed: " + tmpPath + " -> " + path +
+                         ", tmpSize=" + String(tmpSize) + ", copied=" + String(copiedBytes) +
+                         ", decoded=" + String(decodedBytes));
+    }
+    else
+    {
+        debugLog("Download Apps Script saved: " + path);
+    }
     return renamed;
 }
 
@@ -1521,7 +1621,8 @@ String filenameFromUrl(const String &url, uint16_t index)
 
 uint16_t syncFromDriveFolder()
 {
-    debugLog("Sync start");
+    debugLog(String("Sync start build=") + FRAME_BUILD_ID);
+    lastDownloadError = "";
     if (strlen(config.scriptUrl) == 0)
     {
         lastWebMessage = "No Apps Script URL configured.";
@@ -1542,8 +1643,6 @@ uint16_t syncFromDriveFolder()
     }
     debugLog("WiFi connected: ip=" + WiFi.localIP().toString() + ", rssi=" + String(WiFi.RSSI()) +
              ", ssid=" + String(config.wifiSsid));
-
-    showStatus("Syncing photos", "Reading Google Drive manifest...");
 
     HTTPClient http;
     configureHttpClient(http);
@@ -1619,6 +1718,7 @@ uint16_t syncFromDriveFolder()
 
     for (JsonVariant item : photos)
     {
+        serviceWebServerDuringLongTask();
         if (seen >= MAX_MANIFEST_ITEMS)
         {
             debugLog("Manifest item cap reached: " + String((uint16_t)MAX_MANIFEST_ITEMS));
@@ -1664,9 +1764,6 @@ uint16_t syncFromDriveFolder()
             continue;
         }
 
-        showStatus("Syncing photos", "Downloading " + name,
-                   String(downloaded) + " saved, " + String(skipped) + " unchanged");
-
         bool ok = false;
         bool usedAppsScriptDownload = false;
         uint32_t savedSize = 0;
@@ -1682,12 +1779,16 @@ uint16_t syncFromDriveFolder()
             usedAppsScriptDownload = true;
             ok = downloadBase64File(buildScriptUrl("file", id), target, remoteSize, savedSize);
         }
+        else
+        {
+            setDownloadError("Manifest item has no download URL or Drive id: " + name);
+        }
 
         if (ok && remoteSize > 0 && !usedAppsScriptDownload && savedSize != remoteSize)
         {
             display.getSdFat().remove(target.c_str());
-            debugLog("Downloaded size mismatch, removed: " + target + ", expected=" + String(remoteSize) +
-                     ", actual=" + String(savedSize));
+            setDownloadError("Downloaded size mismatch, removed: " + target + ", expected=" + String(remoteSize) +
+                             ", actual=" + String(savedSize));
             ok = false;
         }
 
@@ -1703,14 +1804,18 @@ uint16_t syncFromDriveFolder()
         else
         {
             failed++;
-            debugLog("Download failed: " + target);
+            debugLog("Download failed: " + target +
+                     (lastDownloadError.length() ? ", reason=" + lastDownloadError : ""));
         }
     }
 
     saveSyncState(newStateDoc);
-    WiFi.mode(WIFI_OFF);
+    if (!configModeRunning)
+        WiFi.mode(WIFI_OFF);
     lastWebMessage = "Downloaded " + String(downloaded) + ", skipped " + String(skipped) + ", failed " +
                      String(failed) + " of " + String(seen) + " Drive items.";
+    if (failed > 0 && lastDownloadError.length())
+        lastWebMessage += " Last error: " + lastDownloadError;
     debugLog("Sync done: " + lastWebMessage);
     return downloaded;
 }
@@ -1751,10 +1856,15 @@ void runFrameMode()
     scanPhotos();
     bool syncConfigured = strlen(config.scriptUrl) > 0 && strlen(config.syncToken) > 0 && strlen(config.wifiSsid) > 0;
     bool shouldSync = syncConfigured && (photoCount == 0 || updatesSinceLastSync >= config.syncEveryUpdates);
-    if (shouldSync)
+    bool didSync = false;
+    if (photoCount == 0 && shouldSync)
     {
+        showStatus("No local photos", "Syncing from Drive...");
+        syncInProgress = true;
         syncFromDriveFolder();
+        syncInProgress = false;
         updatesSinceLastSync = 0;
+        didSync = true;
         scanPhotos();
     }
 
@@ -1782,6 +1892,14 @@ void runFrameMode()
 
     if (!shown)
         showStatus("Image error", "No supported photos could be displayed.", config.photoDir);
+
+    if (shown && shouldSync && !didSync)
+    {
+        syncInProgress = true;
+        syncFromDriveFolder();
+        syncInProgress = false;
+        updatesSinceLastSync = 0;
+    }
 
     sleepForMinutes(config.updateMinutes);
 }
@@ -1812,6 +1930,8 @@ void handleIndex()
     {
         html += "<br>Config AP: disabled";
     }
+    html += "<br>Sync: ";
+    html += syncInProgress ? "running" : (configSyncPending ? "queued" : "idle");
     html += "<br>Photos found: " + String(scanPhotos()) + "<br>" + htmlEscape(lastWebMessage) + "</div>";
     html += "<h2>Debug</h2><div class='row'>";
     html += "<a href='/log'>sync_debug.log</a> | <a href='/manifest_response'>last_manifest_response.txt</a>";
@@ -1867,6 +1987,15 @@ void redirectHome()
     server.send(303, "text/plain", "");
 }
 
+bool rejectIfSyncInProgress()
+{
+    if (!syncInProgress)
+        return false;
+
+    server.send(409, "text/plain", "Sync is in progress. Open /log for progress and try this command again later.");
+    return true;
+}
+
 void handleTextFile(const char *path, const char *missingMessage)
 {
     String body = readTextFileTail(path, MAX_DEBUG_LOG_BYTES);
@@ -1887,6 +2016,9 @@ void handleManifestResponse()
 
 void handleClearLog()
 {
+    if (rejectIfSyncInProgress())
+        return;
+
     SdFat &sd = display.getSdFat();
     sd.remove(DEBUG_LOG_PATH);
     sd.remove(MANIFEST_RESPONSE_PATH);
@@ -1896,6 +2028,9 @@ void handleClearLog()
 
 void handleSave()
 {
+    if (rejectIfSyncInProgress())
+        return;
+
     copyString(config.wifiSsid, server.arg("ssid").c_str(), sizeof(config.wifiSsid));
     if (server.arg("password").length() > 0)
         copyString(config.wifiPassword, server.arg("password").c_str(), sizeof(config.wifiPassword));
@@ -1926,15 +2061,23 @@ void handleSave()
 
 void handleSync()
 {
-    uint16_t count = syncFromDriveFolder();
-    scanPhotos();
-    server.send(200, "text/html", "<p>" + lastWebMessage + "</p><p>Total local photos: " + String(photoCount) +
-                                      "</p><p><a href='/'>Back</a></p>");
-    Serial.printf("Synced %u photos\n", count);
+    if (syncInProgress || configSyncPending)
+    {
+        lastWebMessage = "Sync is already running.";
+        redirectHome();
+        return;
+    }
+
+    configSyncPending = true;
+    lastWebMessage = "Sync queued. Open /log for progress.";
+    redirectHome();
 }
 
 void handleShow()
 {
+    if (rejectIfSyncInProgress())
+        return;
+
     scanPhotos();
     if (photoCount == 0)
         lastWebMessage = "No local photos to show.";
@@ -1951,6 +2094,9 @@ void handleShow()
 
 void handleCreateFolder()
 {
+    if (rejectIfSyncInProgress())
+        return;
+
     String requestedPath = server.arg("path");
     if (createManagedFolder(requestedPath))
         lastWebMessage = "Folder created.";
@@ -1961,6 +2107,9 @@ void handleCreateFolder()
 
 void handleDeleteFile()
 {
+    if (rejectIfSyncInProgress())
+        return;
+
     String requestedPath = server.arg("path");
     if (deleteManagedFile(requestedPath))
         lastWebMessage = "File deleted.";
@@ -1972,6 +2121,9 @@ void handleDeleteFile()
 
 void handleDeleteFolder()
 {
+    if (rejectIfSyncInProgress())
+        return;
+
     String requestedPath = server.arg("path");
     if (deleteManagedFolder(requestedPath))
         lastWebMessage = "Folder deleted.";
@@ -1983,6 +2135,9 @@ void handleDeleteFolder()
 
 void handleUploadComplete()
 {
+    if (rejectIfSyncInProgress())
+        return;
+
     if (uploadResultMessage.length() == 0)
         uploadResultMessage = "No upload received.";
     lastWebMessage = uploadResultMessage;
@@ -1992,6 +2147,9 @@ void handleUploadComplete()
 
 void handleUpload()
 {
+    if (syncInProgress)
+        return;
+
     HTTPUpload &upload = server.upload();
     SdFat &sd = display.getSdFat();
 
@@ -2064,6 +2222,9 @@ void handleUpload()
 
 void handleReboot()
 {
+    if (rejectIfSyncInProgress())
+        return;
+
     display.getSdFat().remove(CONFIG_TRIGGER_PATH);
     server.send(200, "text/plain", "Rebooting...");
     delay(500);
@@ -2072,6 +2233,7 @@ void handleReboot()
 
 void runConfigMode()
 {
+    configModeRunning = true;
     bool wifiConnected = refreshConfigNetwork(12000);
     if (lastWebMessage.length() == 0)
     {
@@ -2102,6 +2264,20 @@ void runConfigMode()
     {
         server.handleClient();
 
+        if (configSyncPending && !syncInProgress)
+        {
+            configSyncPending = false;
+            syncInProgress = true;
+            lastWebMessage = "Sync in progress. Open /log for details.";
+            uint16_t count = syncFromDriveFolder();
+            scanPhotos();
+            syncInProgress = false;
+            if (WiFi.status() != WL_CONNECTED && !configApRunning)
+                startConfigAp();
+            lastWebMessage += " Total local photos: " + String(photoCount) + ".";
+            Serial.printf("Synced %u photos\n", count);
+        }
+
         if (configReconnectPending && millis() - configReconnectAt < 0x80000000UL)
         {
             configReconnectPending = false;
@@ -2131,6 +2307,7 @@ void runConfigMode()
                 configApRunning = false;
                 WiFi.disconnect(true);
                 WiFi.mode(WIFI_OFF);
+                configModeRunning = false;
                 return;
             }
         }
