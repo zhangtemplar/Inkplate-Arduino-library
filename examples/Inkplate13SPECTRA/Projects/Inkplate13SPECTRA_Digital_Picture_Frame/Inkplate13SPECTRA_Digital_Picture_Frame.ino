@@ -1266,7 +1266,7 @@ int8_t base64Value(char c)
     return -1;
 }
 
-bool writeBase64Char(SdFile &out, char c, uint8_t quartet[4], uint8_t &quartetLen)
+bool writeBase64Char(SdFile &out, char c, uint8_t quartet[4], uint8_t &quartetLen, uint32_t &decodedBytes)
 {
     int8_t value = base64Value(c);
     if (value == -2)
@@ -1295,14 +1295,20 @@ bool writeBase64Char(SdFile &out, char c, uint8_t quartet[4], uint8_t &quartetLe
     else if (quartet[3] == 64)
         count = 2;
 
-    out.write(decoded, count);
+    if (out.write(decoded, count) != count)
+    {
+        quartetLen = 0;
+        return false;
+    }
+    decodedBytes += count;
     quartetLen = 0;
     return true;
 }
 
-bool downloadBase64File(const String &url, const String &path)
+bool downloadBase64File(const String &url, const String &path, uint32_t expectedSize)
 {
-    debugLog("Download Apps Script start: " + path + " from " + redactUrlToken(url));
+    debugLog("Download Apps Script start: " + path + ", expected=" + String(expectedSize) + " from " +
+             redactUrlToken(url));
     HTTPClient http;
     configureHttpClient(http);
     if (!http.begin(url))
@@ -1313,11 +1319,22 @@ bool downloadBase64File(const String &url, const String &path)
 
     addHttpHeaders(http, "text/plain");
     int code = http.GET();
-    debugLog("Download Apps Script HTTP " + httpStatusText(http, code) + ", type=" + http.header("Content-Type") +
+    String contentType = http.header("Content-Type");
+    debugLog("Download Apps Script HTTP " + httpStatusText(http, code) + ", type=" + contentType +
              ", size=" + String(http.getSize()));
     if (code != HTTP_CODE_OK)
     {
         Serial.printf("Base64 download HTTP %s\n", httpStatusText(http, code).c_str());
+        http.end();
+        return false;
+    }
+
+    String lowerContentType = contentType;
+    lowerContentType.toLowerCase();
+    if (lowerContentType.indexOf("json") >= 0 || lowerContentType.indexOf("html") >= 0)
+    {
+        String response = http.getString();
+        debugLog("Download Apps Script returned non-base64 response: " + compactPreview(response, 220));
         http.end();
         return false;
     }
@@ -1339,6 +1356,8 @@ bool downloadBase64File(const String &url, const String &path)
     uint8_t input[2048];
     uint8_t quartet[4] = {0};
     uint8_t quartetLen = 0;
+    uint32_t inputBytes = 0;
+    uint32_t decodedBytes = 0;
     uint32_t lastData = millis();
     bool ok = true;
 
@@ -1353,12 +1372,15 @@ bool downloadBase64File(const String &url, const String &path)
             {
                 for (int i = 0; i < got; ++i)
                 {
-                    if (!writeBase64Char(out, (char)input[i], quartet, quartetLen))
+                    if (!writeBase64Char(out, (char)input[i], quartet, quartetLen, decodedBytes))
                     {
+                        debugLog("Download Apps Script base64/write failed at input byte " + String(inputBytes + i) +
+                                 ", char=" + String((uint8_t)input[i]));
                         ok = false;
                         break;
                     }
                 }
+                inputBytes += got;
                 if (!ok)
                     break;
                 if (remaining > 0)
@@ -1386,10 +1408,19 @@ bool downloadBase64File(const String &url, const String &path)
 
     out.close();
     http.end();
+    debugLog("Download Apps Script stream done: inputBytes=" + String(inputBytes) +
+             ", decodedBytes=" + String(decodedBytes) + ", remaining=" + String(remaining));
 
     if (!ok || remaining > 0)
     {
         debugLog("Download Apps Script failed: " + path + ", remaining=" + String(remaining));
+        sd.remove(tmpPath.c_str());
+        return false;
+    }
+    if (expectedSize > 0 && decodedBytes != expectedSize)
+    {
+        debugLog("Download Apps Script decoded size mismatch: expected=" + String(expectedSize) +
+                 ", decoded=" + String(decodedBytes));
         sd.remove(tmpPath.c_str());
         return false;
     }
@@ -1438,13 +1469,21 @@ JsonObject findStateEntry(JsonArray statePhotos, const String &id)
     return JsonObject();
 }
 
-bool localFileMatches(const String &path, uint32_t expectedSize)
+bool localFileSize(const String &path, uint32_t &actualSize)
 {
     SdFile file;
     if (!file.open(path.c_str(), O_RDONLY))
         return false;
-    uint32_t actualSize = file.fileSize();
+    actualSize = file.fileSize();
     file.close();
+    return true;
+}
+
+bool localFileMatches(const String &path, uint32_t expectedSize)
+{
+    uint32_t actualSize = 0;
+    if (!localFileSize(path, actualSize))
+        return false;
     return actualSize == expectedSize;
 }
 
@@ -1622,12 +1661,15 @@ uint16_t syncFromDriveFolder()
         if (url.length())
             ok = downloadFile(url, target);
         else if (id.length())
-            ok = downloadBase64File(buildScriptUrl("file", id), target);
+            ok = downloadBase64File(buildScriptUrl("file", id), target, remoteSize);
 
         if (ok && remoteSize > 0 && !localFileMatches(target, remoteSize))
         {
+            uint32_t actualSize = 0;
+            localFileSize(target, actualSize);
             display.getSdFat().remove(target.c_str());
-            debugLog("Downloaded size mismatch, removed: " + target);
+            debugLog("Downloaded size mismatch, removed: " + target + ", expected=" + String(remoteSize) +
+                     ", actual=" + String(actualSize));
             ok = false;
         }
 
