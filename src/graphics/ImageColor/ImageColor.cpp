@@ -91,6 +91,18 @@ void ImageColor::setDitherKernel(const DitherKernel kernel)
     currentKernel = &DITHER_KERNELS[kernelIndex];
 }
 
+void ImageColor::setJpegScale(uint8_t scale)
+{
+    if (scale != 1 && scale != 2 && scale != 4 && scale != 8)
+        scale = 1;
+    jpegScale = scale;
+}
+
+uint8_t ImageColor::getJpegScale() const
+{
+    return jpegScale;
+}
+
 /**
  * @brief       draw function draws image from string path
  *

@@ -36,7 +36,7 @@ static const char *MANIFEST_RESPONSE_PATH = "/frame/last_manifest_response.txt";
 static const char *DEFAULT_PHOTO_DIR = "/frame/photos";
 static const char *AP_SSID = "Inkplate13Frame";
 static const char *AP_PASSWORD = "inkplate13";
-static const char *FRAME_BUILD_ID = "sync-debug-2026-10-19-9";
+static const char *FRAME_BUILD_ID = "quality-sync-2026-10-25-1";
 
 static const uint16_t MAX_PHOTOS = 128;
 static const uint8_t MAX_MANIFEST_ITEMS = 48;
@@ -50,6 +50,7 @@ static const uint16_t HTTP_READ_TIMEOUT_MS = 60000;
 static const uint32_t DOWNLOAD_IDLE_TIMEOUT_MS = 15000;
 static const uint32_t SD_DOWNLOAD_MARGIN_BYTES = 262144;
 static const size_t DECODED_WRITE_BUFFER_BYTES = 7680;
+static const uint32_t LARGE_APPS_SCRIPT_FILE_BYTES = 8UL * 1024UL * 1024UL;
 static const uint8_t PHOTO_ROTATION_PORTRAIT = 0;
 static const uint8_t PHOTO_ROTATION_LANDSCAPE = 1;
 
@@ -485,6 +486,60 @@ bool hasSupportedExtension(String name)
            name.endsWith(".bmp");
 }
 
+bool hasCommonImageExtension(String name)
+{
+    name.toLowerCase();
+    return name.endsWith(".jpg") || name.endsWith(".jpeg") || name.endsWith(".png") || name.endsWith(".bmp");
+}
+
+bool hasBinExtension(String name)
+{
+    name.toLowerCase();
+    return name.endsWith(".bin");
+}
+
+String pathWithBinExtension(String path)
+{
+    int slash = path.lastIndexOf('/');
+    int dot = path.lastIndexOf('.');
+    if (dot <= slash)
+        return path + ".bin";
+    return path.substring(0, dot) + ".bin";
+}
+
+String filenameStem(String path)
+{
+    int slash = path.lastIndexOf('/');
+    if (slash >= 0)
+        path = path.substring(slash + 1);
+    int dot = path.lastIndexOf('.');
+    if (dot > 0)
+        path = path.substring(0, dot);
+    path.toLowerCase();
+    return path;
+}
+
+bool photoPathAlreadyListed(const String &path)
+{
+    for (uint16_t i = 0; i < photoCount; ++i)
+    {
+        if (photoList[i] == path)
+            return true;
+    }
+    return false;
+}
+
+String preferredPhotoPath(const String &path)
+{
+    if (!hasCommonImageExtension(path))
+        return path;
+
+    String binPath = pathWithBinExtension(path);
+    if (display.getSdFat().exists(binPath.c_str()))
+        return binPath;
+    return path;
+}
+
 String sanitizeFilename(String name, uint16_t fallbackIndex)
 {
     int query = name.indexOf('?');
@@ -508,6 +563,24 @@ String sanitizeFilename(String name, uint16_t fallbackIndex)
             out += '_';
     }
     return out;
+}
+
+bool manifestHasBinSibling(JsonArray photos, const String &name)
+{
+    if (!hasCommonImageExtension(name))
+        return false;
+
+    String stem = filenameStem(name);
+    for (JsonVariant value : photos)
+    {
+        if (!value.is<JsonObject>())
+            continue;
+        JsonObject item = value.as<JsonObject>();
+        String otherName = sanitizeFilename(item["name"] | "", 0);
+        if (hasBinExtension(otherName) && filenameStem(otherName) == stem)
+            return true;
+    }
+    return false;
 }
 
 String sanitizePathSegment(String segment)
@@ -769,7 +842,11 @@ void scanPhotosInDir(const String &dirPath, uint8_t depth)
         String childPath = joinPath(dirPath.c_str(), String(name));
         bool isDirectory = entry.isDir();
         if (!isDirectory && hasSupportedExtension(String(name)))
-            photoList[photoCount++] = childPath;
+        {
+            String preferredPath = preferredPhotoPath(childPath);
+            if (!photoPathAlreadyListed(preferredPath))
+                photoList[photoCount++] = preferredPath;
+        }
         entry.close();
 
         if (isDirectory)
@@ -1122,6 +1199,31 @@ uint16_t logicalHeightForRotation(uint8_t rotation)
     return (rotation == PHOTO_ROTATION_LANDSCAPE || rotation == 3) ? E_INK_WIDTH : E_INK_HEIGHT;
 }
 
+uint16_t scaledDimension(uint16_t value, uint8_t scale)
+{
+    return (value + scale - 1) / scale;
+}
+
+uint8_t jpegScaleForDimensions(const ImageDimensions &dimensions, uint8_t rotation)
+{
+    if (!dimensions.valid)
+        return 1;
+
+    uint16_t screenWidth = logicalWidthForRotation(rotation);
+    uint16_t screenHeight = logicalHeightForRotation(rotation);
+    const uint8_t scales[] = {1, 2, 4, 8};
+
+    for (uint8_t scale : scales)
+    {
+        if (scaledDimension(dimensions.width, scale) <= screenWidth &&
+            scaledDimension(dimensions.height, scale) <= screenHeight)
+        {
+            return scale;
+        }
+    }
+    return 8;
+}
+
 int16_t centeredOffset(uint16_t contentSize, uint16_t screenSize)
 {
     return contentSize < screenSize ? (int16_t)((screenSize - contentSize) / 2) : 0;
@@ -1223,16 +1325,32 @@ bool drawCommonImageFromSd(const char *path, const ImageDimensions &dimensions, 
 {
     String lower(path);
     lower.toLowerCase();
+    bool isJpeg = lower.endsWith(".jpg") || lower.endsWith(".jpeg");
+    uint8_t jpegScale = isJpeg ? jpegScaleForDimensions(dimensions, rotation) : 1;
+    uint16_t renderWidth = dimensions.width;
+    uint16_t renderHeight = dimensions.height;
+    if (dimensions.valid && isJpeg)
+    {
+        renderWidth = scaledDimension(dimensions.width, jpegScale);
+        renderHeight = scaledDimension(dimensions.height, jpegScale);
+    }
+
     int16_t x = 0;
     int16_t y = 0;
     if (dimensions.valid)
     {
-        x = centeredOffset(dimensions.width, logicalWidthForRotation(rotation));
-        y = centeredOffset(dimensions.height, logicalHeightForRotation(rotation));
+        x = centeredOffset(renderWidth, logicalWidthForRotation(rotation));
+        y = centeredOffset(renderHeight, logicalHeightForRotation(rotation));
     }
 
-    if (lower.endsWith(".jpg") || lower.endsWith(".jpeg"))
+    if (isJpeg)
+    {
+        display.image.setJpegScale(jpegScale);
+        debugLog("Render JPEG fallback: " + String(path) + ", source=" + String(dimensions.width) + "x" +
+                 String(dimensions.height) + ", scale=" + String(jpegScale) + ", render=" + String(renderWidth) +
+                 "x" + String(renderHeight));
         return display.image.draw(path, ImageColor::JPG, x, y, true, false);
+    }
     if (lower.endsWith(".png"))
         return display.image.draw(path, ImageColor::PNG, x, y, true, false);
     if (lower.endsWith(".bmp"))
@@ -1242,22 +1360,25 @@ bool drawCommonImageFromSd(const char *path, const ImageDimensions &dimensions, 
 
 bool displayPhoto(const String &path)
 {
+    String renderPath = preferredPhotoPath(path);
     Serial.print("Displaying ");
-    Serial.println(path);
+    Serial.println(renderPath);
+    if (renderPath != path)
+        debugLog("Using BIN sibling for display: " + path + " -> " + renderPath);
 
     bool ok = false;
-    String lower(path);
+    String lower(renderPath);
     lower.toLowerCase();
     ImageDimensions dimensions;
-    readImageDimensions(path.c_str(), lower, dimensions);
+    readImageDimensions(renderPath.c_str(), lower, dimensions);
     uint8_t rotation = photoRotationForDimensions(dimensions);
     display.setRotation(rotation);
 
     display.clearDisplay();
     if (lower.endsWith(".bin"))
-        ok = drawBinFromSd(path.c_str());
+        ok = drawBinFromSd(renderPath.c_str());
     else
-        ok = drawCommonImageFromSd(path.c_str(), dimensions, rotation);
+        ok = drawCommonImageFromSd(renderPath.c_str(), dimensions, rotation);
 
     if (ok)
         display.display();
@@ -2014,9 +2135,26 @@ uint16_t syncFromDriveFolder()
         }
 
         debugLog("Manifest item " + String(seen) + ": name=" + name + ", idLen=" + String(id.length()) +
-                 ", size=" + String(remoteSize) + ", modified=" + modified);
+                 ", size=" + String(remoteSize) + " (" + formatBytes(remoteSize) + "), modified=" + modified);
 
         String target = joinPath(config.photoDir, name);
+        if (hasCommonImageExtension(name))
+        {
+            String binTarget = pathWithBinExtension(target);
+            if (display.getSdFat().exists(binTarget.c_str()))
+            {
+                skipped++;
+                debugLog("Skipped common image because local BIN sibling exists: " + target + " -> " + binTarget);
+                continue;
+            }
+            if (manifestHasBinSibling(photos, name))
+            {
+                skipped++;
+                debugLog("Skipped common image because Drive manifest has BIN sibling: " + name);
+                continue;
+            }
+        }
+
         JsonObject oldEntry = findStateEntry(oldState, id);
         uint32_t expectedLocalSize = stateLocalSize(oldEntry, remoteSize);
         bool unchanged = id.length() > 0 && expectedLocalSize > 0 && localFileMatches(target, expectedLocalSize) &&
@@ -2043,6 +2181,11 @@ uint16_t syncFromDriveFolder()
         else if (id.length())
         {
             usedAppsScriptDownload = true;
+            if (remoteSize >= LARGE_APPS_SCRIPT_FILE_BYTES)
+            {
+                debugLog("Large Apps Script file warning: " + name + " is " + formatBytes(remoteSize) +
+                         " before base64; prefer a converter-generated .bin or resized JPEG.");
+            }
             ok = downloadBase64File(buildScriptUrl("file", id), target, remoteSize, savedSize);
         }
         else
@@ -2586,6 +2729,7 @@ void setup()
 {
     Serial.begin(115200);
     display.begin();
+    display.image.setDitherKernel(ImageColor::Stucki);
     display.setTextColor(INKPLATE_BLACK);
     display.setTextSize(2);
 
