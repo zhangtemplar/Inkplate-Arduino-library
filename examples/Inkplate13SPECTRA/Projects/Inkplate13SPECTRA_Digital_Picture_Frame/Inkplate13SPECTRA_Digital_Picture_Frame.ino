@@ -36,7 +36,7 @@ static const char *MANIFEST_RESPONSE_PATH = "/frame/last_manifest_response.txt";
 static const char *DEFAULT_PHOTO_DIR = "/frame/photos";
 static const char *AP_SSID = "Inkplate13Frame";
 static const char *AP_PASSWORD = "inkplate13";
-static const char *FRAME_BUILD_ID = "sync-debug-2026-10-19-7";
+static const char *FRAME_BUILD_ID = "sync-debug-2026-10-19-8";
 
 static const uint16_t MAX_PHOTOS = 128;
 static const uint8_t MAX_MANIFEST_ITEMS = 48;
@@ -1361,7 +1361,7 @@ int8_t base64Value(char c)
     return -1;
 }
 
-bool decodeBase64Char(char c, uint8_t quartet[4], uint8_t &quartetLen, uint8_t decoded[3], uint8_t &decodedCount,
+bool decodeBase64Char(char c, uint8_t quartet[4], uint8_t &quartetLen, uint8_t decodedOut[3], uint8_t &decodedCount,
                       const char **failureReason)
 {
     decodedCount = 0;
@@ -1387,10 +1387,9 @@ bool decodeBase64Char(char c, uint8_t quartet[4], uint8_t &quartetLen, uint8_t d
         return false;
     }
 
-    uint8_t decoded[3];
-    decoded[0] = (quartet[0] << 2) | (quartet[1] >> 4);
-    decoded[1] = ((quartet[1] & 0x0F) << 4) | (quartet[2] >> 2);
-    decoded[2] = ((quartet[2] & 0x03) << 6) | quartet[3];
+    decodedOut[0] = (quartet[0] << 2) | (quartet[1] >> 4);
+    decodedOut[1] = ((quartet[1] & 0x0F) << 4) | (quartet[2] >> 2);
+    decodedOut[2] = ((quartet[2] & 0x03) << 6) | quartet[3];
 
     uint8_t count = 3;
     if (quartet[2] == 64)
