@@ -36,7 +36,7 @@ static const char *MANIFEST_RESPONSE_PATH = "/frame/last_manifest_response.txt";
 static const char *DEFAULT_PHOTO_DIR = "/frame/photos";
 static const char *AP_SSID = "Inkplate13Frame";
 static const char *AP_PASSWORD = "inkplate13";
-static const char *FRAME_BUILD_ID = "sync-debug-2026-10-19-8";
+static const char *FRAME_BUILD_ID = "sync-debug-2026-10-19-9";
 
 static const uint16_t MAX_PHOTOS = 128;
 static const uint8_t MAX_MANIFEST_ITEMS = 48;
@@ -49,7 +49,7 @@ static const int32_t HTTP_CONNECT_TIMEOUT_MS = 20000;
 static const uint16_t HTTP_READ_TIMEOUT_MS = 60000;
 static const uint32_t DOWNLOAD_IDLE_TIMEOUT_MS = 15000;
 static const uint32_t SD_DOWNLOAD_MARGIN_BYTES = 262144;
-static const size_t DECODED_WRITE_BUFFER_BYTES = 8192;
+static const size_t DECODED_WRITE_BUFFER_BYTES = 7680;
 static const uint8_t PHOTO_ROTATION_PORTRAIT = 0;
 static const uint8_t PHOTO_ROTATION_LANDSCAPE = 1;
 
@@ -95,6 +95,7 @@ bool configApRunning = false;
 bool configModeRunning = false;
 bool configSyncPending = false;
 bool syncInProgress = false;
+bool sdCriticalWriteActive = false;
 uint32_t lastLongTaskWebService = 0;
 
 static const uint8_t BIN_MAGIC[8] = {'I', 'P', '1', '3', 'S', 'P', '6', 'B'};
@@ -440,6 +441,7 @@ bool copySdFile(const String &fromPath, const String &toPath, uint32_t &copiedBy
         return false;
     }
 
+    sdCriticalWriteActive = true;
     uint8_t buffer[2048];
     bool ok = true;
     while (in.available())
@@ -460,6 +462,7 @@ bool copySdFile(const String &fromPath, const String &toPath, uint32_t &copiedBy
     }
 
     out.close();
+    sdCriticalWriteActive = false;
     in.close();
     if (!ok)
         sd.remove(toPath.c_str());
@@ -1160,6 +1163,11 @@ void serviceWebServerDuringLongTask()
 {
     if (!configModeRunning)
         return;
+    if (sdCriticalWriteActive)
+    {
+        delay(0);
+        return;
+    }
     if (millis() - lastLongTaskWebService < 25)
         return;
 
@@ -1296,7 +1304,9 @@ bool downloadFile(const String &url, const String &path)
     uint8_t buffer[2048];
     uint32_t lastData = millis();
     bool ok = true;
+    String directDownloadError;
 
+    sdCriticalWriteActive = true;
     while ((http.connected() || stream->available()) && (remaining > 0 || remaining == -1))
     {
         size_t available = stream->available();
@@ -1306,7 +1316,12 @@ bool downloadFile(const String &url, const String &path)
             int got = stream->readBytes(buffer, toRead);
             if (got > 0)
             {
-                out.write(buffer, got);
+                if (out.write(buffer, got) != (size_t)got)
+                {
+                    directDownloadError = "Download direct SD write failed: " + path + ", chunk=" + String(got);
+                    ok = false;
+                    break;
+                }
                 if (remaining > 0)
                     remaining -= got;
                 lastData = millis();
@@ -1317,7 +1332,7 @@ bool downloadFile(const String &url, const String &path)
         {
             if (millis() - lastData > DOWNLOAD_IDLE_TIMEOUT_MS)
             {
-                debugLog("Download direct idle timeout: " + path);
+                directDownloadError = "Download direct idle timeout: " + path;
                 ok = false;
                 break;
             }
@@ -1327,10 +1342,13 @@ bool downloadFile(const String &url, const String &path)
     }
 
     out.close();
+    sdCriticalWriteActive = false;
     http.end();
 
     if (!ok || remaining > 0)
     {
+        if (directDownloadError.length())
+            debugLog(directDownloadError);
         debugLog("Download direct failed: " + path + ", remaining=" + String(remaining));
         sd.remove(tmpPath.c_str());
         return false;
@@ -1510,7 +1528,7 @@ class Base64SdDecodeStream : public Stream
         String stats = statsString(expectedSize);
         if (expectedSize > 0 && decodedBytes == expectedSize)
         {
-            debugLog("Download Apps Script ignored trailing incomplete base64 quartet" + stats);
+            warningMessage = "Download Apps Script ignored trailing incomplete base64 quartet" + stats;
             quartetLen = 0;
             if (!flushDecodedBuffer())
                 return false;
@@ -1558,6 +1576,11 @@ class Base64SdDecodeStream : public Stream
         return errorMessage;
     }
 
+    const String &warning() const
+    {
+        return warningMessage;
+    }
+
   private:
     bool appendDecoded(const uint8_t *decoded, uint8_t count)
     {
@@ -1592,6 +1615,7 @@ class Base64SdDecodeStream : public Stream
 
         decodedFlushCount++;
         decodedBufferLen = 0;
+        delay(0);
         return true;
     }
 
@@ -1605,6 +1629,7 @@ class Base64SdDecodeStream : public Stream
     uint32_t decodedBytes = 0;
     uint32_t decodedFlushCount = 0;
     String responsePreview;
+    String warningMessage;
     String errorMessage;
     bool failed = false;
 };
@@ -1695,14 +1720,18 @@ bool downloadBase64File(const String &url, const String &path, uint32_t expected
         return false;
     }
 
+    sdCriticalWriteActive = true;
     Base64SdDecodeStream decoder(out);
     int bodyBytes = http.writeToStream(&decoder);
     bool ok = decoder.finish(expectedSize);
 
     out.close();
+    sdCriticalWriteActive = false;
     http.end();
     uint32_t decodedBytes = decoder.decodedSize();
     decodedSize = decodedBytes;
+    if (decoder.warning().length())
+        debugLog(decoder.warning());
     debugLog("Download Apps Script stream done: bodyBytes=" + String(bodyBytes) +
              ", inputBytes=" + String(decoder.inputSize()) + ", base64Chars=" + String(decoder.base64CharCount()) +
              ", decodedBytes=" + String(decodedBytes) + ", sdFlushes=" + String(decoder.flushCount()));
