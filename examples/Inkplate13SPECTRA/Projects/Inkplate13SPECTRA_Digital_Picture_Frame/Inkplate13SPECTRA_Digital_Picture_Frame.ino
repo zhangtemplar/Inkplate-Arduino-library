@@ -36,7 +36,7 @@ static const char *MANIFEST_RESPONSE_PATH = "/frame/last_manifest_response.txt";
 static const char *DEFAULT_PHOTO_DIR = "/frame/photos";
 static const char *AP_SSID = "Inkplate13Frame";
 static const char *AP_PASSWORD = "inkplate13";
-static const char *FRAME_BUILD_ID = "quality-sync-2026-10-25-1";
+static const char *FRAME_BUILD_ID = "quality-sync-2026-10-25-2";
 
 static const uint16_t MAX_PHOTOS = 128;
 static const uint8_t MAX_MANIFEST_ITEMS = 48;
@@ -1199,31 +1199,6 @@ uint16_t logicalHeightForRotation(uint8_t rotation)
     return (rotation == PHOTO_ROTATION_LANDSCAPE || rotation == 3) ? E_INK_WIDTH : E_INK_HEIGHT;
 }
 
-uint16_t scaledDimension(uint16_t value, uint8_t scale)
-{
-    return (value + scale - 1) / scale;
-}
-
-uint8_t jpegScaleForDimensions(const ImageDimensions &dimensions, uint8_t rotation)
-{
-    if (!dimensions.valid)
-        return 1;
-
-    uint16_t screenWidth = logicalWidthForRotation(rotation);
-    uint16_t screenHeight = logicalHeightForRotation(rotation);
-    const uint8_t scales[] = {1, 2, 4, 8};
-
-    for (uint8_t scale : scales)
-    {
-        if (scaledDimension(dimensions.width, scale) <= screenWidth &&
-            scaledDimension(dimensions.height, scale) <= screenHeight)
-        {
-            return scale;
-        }
-    }
-    return 8;
-}
-
 int16_t centeredOffset(uint16_t contentSize, uint16_t screenSize)
 {
     return contentSize < screenSize ? (int16_t)((screenSize - contentSize) / 2) : 0;
@@ -1326,14 +1301,8 @@ bool drawCommonImageFromSd(const char *path, const ImageDimensions &dimensions, 
     String lower(path);
     lower.toLowerCase();
     bool isJpeg = lower.endsWith(".jpg") || lower.endsWith(".jpeg");
-    uint8_t jpegScale = isJpeg ? jpegScaleForDimensions(dimensions, rotation) : 1;
     uint16_t renderWidth = dimensions.width;
     uint16_t renderHeight = dimensions.height;
-    if (dimensions.valid && isJpeg)
-    {
-        renderWidth = scaledDimension(dimensions.width, jpegScale);
-        renderHeight = scaledDimension(dimensions.height, jpegScale);
-    }
 
     int16_t x = 0;
     int16_t y = 0;
@@ -1345,10 +1314,8 @@ bool drawCommonImageFromSd(const char *path, const ImageDimensions &dimensions, 
 
     if (isJpeg)
     {
-        display.image.setJpegScale(jpegScale);
         debugLog("Render JPEG fallback: " + String(path) + ", source=" + String(dimensions.width) + "x" +
-                 String(dimensions.height) + ", scale=" + String(jpegScale) + ", render=" + String(renderWidth) +
-                 "x" + String(renderHeight));
+                 String(dimensions.height) + ", render=" + String(renderWidth) + "x" + String(renderHeight));
         return display.image.draw(path, ImageColor::JPG, x, y, true, false);
     }
     if (lower.endsWith(".png"))

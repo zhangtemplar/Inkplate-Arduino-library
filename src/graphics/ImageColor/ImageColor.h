@@ -119,8 +119,6 @@ class ImageColor
     bool drawPngFromWeb(WiFiClient *s, int x, int y, int32_t len, bool dither = 0, bool invert = 0);
 
     void setDitherKernel(const DitherKernel kernel);
-    void setJpegScale(uint8_t scale);
-    uint8_t getJpegScale() const;
 
     // Should be private, but needed in a png callback :(
     uint8_t ditherGetPixelBmp(uint32_t px, int i, int j, int w, bool paletted);
@@ -164,7 +162,6 @@ class ImageColor
 
     uint16_t *jpegRowBuffer = nullptr;
     uint16_t jpegImageWidth = 0;
-    uint8_t jpegScale = 1;
     uint8_t jpegMcuH = 0;
     int jpegDrawX = 0, jpegDrawY = 0;
     bool jpegDither = false, jpegInvert = false;

@@ -24,11 +24,6 @@
 
 extern ImageColor *_imagePtrJpeg;
 
-static uint16_t scaledJpegDimension(uint16_t value, uint8_t scale)
-{
-    return (value + scale - 1) / scale;
-}
-
 /**
  * @brief       drawJpegFromSd function draws jpeg image from sd file
  *
@@ -178,15 +173,13 @@ bool ImageColor::drawJpegFromWebAtPosition(const char *url, const Position &posi
 
     uint16_t w = 0;
     uint16_t h = 0;
-    TJpgDec.setJpgScale(jpegScale);
+    TJpgDec.setJpgScale(1);
     JRESULT r = TJpgDec.getJpgSize(&w, &h, buff, defaultLen);
     if (r != JDR_OK)
     {
         free(buff);
         return 0;
     }
-    w = scaledJpegDimension(w, jpegScale);
-    h = scaledJpegDimension(h, jpegScale);
 
     uint16_t posX, posY;
     getPointsForPosition(position, w, h, E_INK_WIDTH, E_INK_HEIGHT, &posX, &posY);
@@ -241,15 +234,13 @@ bool ImageColor::drawJpegFromSdAtPosition(const char *fileName, const Position &
 
     uint16_t w = 0;
     uint16_t h = 0;
-    TJpgDec.setJpgScale(jpegScale);
+    TJpgDec.setJpgScale(1);
     JRESULT r = TJpgDec.getJpgSize(&w, &h, buff, total);
     if (r != JDR_OK)
     {
         free(buff);
         return 0;
     }
-    w = scaledJpegDimension(w, jpegScale);
-    h = scaledJpegDimension(h, jpegScale);
 
     uint16_t posX, posY;
     getPointsForPosition(position, w, h, E_INK_WIDTH, E_INK_HEIGHT, &posX, &posY);
@@ -327,13 +318,13 @@ bool ImageColor::drawJpegFromBuffer(uint8_t *buff, int32_t len, int x, int y, bo
 
     memset(ditherBuffer, 0, ditherBufferSizeBytes);
 
-    TJpgDec.setJpgScale(jpegScale);
+    TJpgDec.setJpgScale(1);
     TJpgDec.setCallback(drawJpegChunk);
 
     uint16_t imgW = 0, imgH = 0;
     if (TJpgDec.getJpgSize(&imgW, &imgH, buff, len) != JDR_OK)
         return false;
-    jpegImageWidth = scaledJpegDimension(imgW, jpegScale);
+    jpegImageWidth = imgW;
 
     // Allocate row buffer: one MCU row wide (max 16 rows tall) at full image width
     jpegRowBuffer = (uint16_t *)ps_malloc(jpegImageWidth * 16 * sizeof(uint16_t));
