@@ -14,7 +14,14 @@
 const FOLDER_ID = 'PASTE_GOOGLE_DRIVE_FOLDER_ID_HERE';
 const SYNC_TOKEN = 'CHANGE_THIS_SHARED_SECRET';
 
-const SUPPORTED_EXTENSIONS = ['.bin', '.jpg', '.jpeg', '.png', '.bmp'];
+// Apps Script cannot run the Pillow-quality BIN converter directly. Run the
+// companion Python converter against a local Google Drive synced folder, or use
+// an external converter service, then let this manifest expose the BIN files.
+const MANIFEST_BIN_ONLY = false;
+const HIDE_SOURCE_IMAGES_WHEN_BIN_EXISTS = true;
+
+const BIN_EXTENSION = '.bin';
+const SOURCE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.bmp'];
 const MAX_MANIFEST_ITEMS = 48;
 
 function doGet(e) {
@@ -33,25 +40,50 @@ function doGet(e) {
 function manifestOutput() {
   const folder = DriveApp.getFolderById(FOLDER_ID);
   const files = folder.getFiles();
-  const photos = [];
+  const candidates = [];
+  const binStems = {};
 
-  while (files.hasNext() && photos.length < MAX_MANIFEST_ITEMS) {
+  while (files.hasNext()) {
     const file = files.next();
     const name = file.getName();
-    if (!isSupportedName(name)) {
+    const extension = extensionForName(name);
+    if (!isSupportedExtension(extension)) {
       continue;
     }
 
+    const stem = filenameStem(name);
+    candidates.push({
+      file: file,
+      name: name,
+      extension: extension,
+      stem: stem
+    });
+
+    if (extension === BIN_EXTENSION) {
+      binStems[stem.toLowerCase()] = true;
+    }
+  }
+
+  candidates.sort((a, b) => a.name.localeCompare(b.name));
+
+  const photos = [];
+
+  for (let i = 0; i < candidates.length && photos.length < MAX_MANIFEST_ITEMS; i++) {
+    const item = candidates[i];
+    if (!isManifestVisible(item, binStems)) {
+      continue;
+    }
+
+    const file = item.file;
     photos.push({
       id: file.getId(),
-      name: name,
+      name: item.name,
       modified: file.getLastUpdated().toISOString(),
       size: file.getSize(),
       mimeType: file.getMimeType()
     });
   }
 
-  photos.sort((a, b) => a.name.localeCompare(b.name));
   return jsonOutput({photos: photos});
 }
 
@@ -61,7 +93,7 @@ function fileOutput(id) {
   }
 
   const file = DriveApp.getFileById(id);
-  if (!isSupportedName(file.getName()) || !fileIsInConfiguredFolder(file)) {
+  if (!isDownloadAllowedName(file.getName()) || !fileIsInConfiguredFolder(file)) {
     return jsonOutput({error: 'file not allowed'});
   }
 
@@ -81,8 +113,40 @@ function fileIsInConfiguredFolder(file) {
 }
 
 function isSupportedName(name) {
+  return isSupportedExtension(extensionForName(name));
+}
+
+function isSupportedExtension(extension) {
+  return extension === BIN_EXTENSION || SOURCE_EXTENSIONS.indexOf(extension) >= 0;
+}
+
+function isDownloadAllowedName(name) {
+  const extension = extensionForName(name);
+  if (MANIFEST_BIN_ONLY) {
+    return extension === BIN_EXTENSION;
+  }
+  return isSupportedExtension(extension);
+}
+
+function isManifestVisible(item, binStems) {
+  if (MANIFEST_BIN_ONLY) {
+    return item.extension === BIN_EXTENSION;
+  }
+  if (HIDE_SOURCE_IMAGES_WHEN_BIN_EXISTS && item.extension !== BIN_EXTENSION) {
+    return !binStems[item.stem.toLowerCase()];
+  }
+  return true;
+}
+
+function extensionForName(name) {
   const lower = name.toLowerCase();
-  return SUPPORTED_EXTENSIONS.some(ext => lower.endsWith(ext));
+  const dot = lower.lastIndexOf('.');
+  return dot >= 0 ? lower.substring(dot) : '';
+}
+
+function filenameStem(name) {
+  const dot = name.lastIndexOf('.');
+  return dot >= 0 ? name.substring(0, dot) : name;
 }
 
 function jsonOutput(value) {

@@ -36,6 +36,8 @@ The manifest includes `id`, `name`, `modified`, and `size`. The Inkplate saves `
 
 Apps Script sends file content as base64 text, which is about 33% larger on the wire than the original file. Very large phone JPEGs can be slow or unreliable on the ESP32 and do not render as well as preprocessed frames. Prefer syncing `.bin` files or resized JPEGs under a few MB. A generated `.bin` frame is about 0.96 MB.
 
+Apps Script does not include a Pillow/canvas-quality pixel pipeline, so the included script does not convert Drive images to BIN by itself. For a Drive-first workflow, run the Python converter against a local Google Drive synced folder so it creates `.bin` siblings. In `google_drive_apps_script.gs`, set `MANIFEST_BIN_ONLY = true` when you want the Inkplate to see only generated BIN files. Leave `HIDE_SOURCE_IMAGES_WHEN_BIN_EXISTS = true` to hide JPG/PNG/BMP originals whenever a matching BIN sibling exists.
+
 ## Config Mode
 
 On first boot, the frame starts an access point named `Inkplate13Frame` with password `inkplate13`. Open the IP shown on the display, usually `http://192.168.4.1`. Configure Wi-Fi, Apps Script URL, sync token, sync cadence, photo folder, shuffle mode, update interval, and low-battery threshold. After Wi-Fi is configured, config mode first tries the home network and disables the setup AP when the connection works; the display shows the home-network URL. If Wi-Fi is missing or fails, the fallback AP is enabled again.
@@ -59,4 +61,11 @@ pip3 install Pillow
 python3 tools/convert_to_inkplate13spectra_bin.py photo.jpg /Volumes/SDCARD/frame/photos/photo.bin --preview photo_preview.png
 ```
 
-The converter defaults to `--orientation auto`, using a 1600x1200 landscape canvas for wide images and a 1200x1600 portrait canvas for tall images. Override with `--orientation landscape` or `--orientation portrait` when you want a fixed layout. It resizes with Lanczos, dithers into the six Spectra colors, then stores the packed native framebuffer for fast, high-quality display. Runtime JPG rendering is a fallback path; it now uses stronger Stucki dithering and coarse JPEG decoder scaling, but it cannot match the converter's resize quality.
+Batch convert a folder, including `~`, relative, absolute, directory, and glob inputs:
+
+```sh
+python3 tools/convert_to_inkplate13spectra_bin.py ~/Pictures/frame --recursive
+python3 tools/convert_to_inkplate13spectra_bin.py "./photos/*.jpg" --output-dir /Volumes/SDCARD/frame/photos
+```
+
+The converter defaults to `--orientation auto`, using a 1600x1200 landscape canvas for wide images and a 1200x1600 portrait canvas for tall images. It now defaults to `--fit contain` so artwork is not cropped; use `--fit cover` when you prefer full-screen crop. It resizes with Lanczos, applies light sharpening, uses Stucki error diffusion into the six Spectra colors, then stores the packed native framebuffer for fast, high-quality display. Runtime JPG/PNG/BMP rendering is a fallback path; it does not perform high-quality aspect-fit resizing and cannot match the converter's output.

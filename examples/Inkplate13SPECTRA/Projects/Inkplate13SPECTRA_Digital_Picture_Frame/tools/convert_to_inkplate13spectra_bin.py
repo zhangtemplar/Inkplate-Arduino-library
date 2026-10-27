@@ -10,12 +10,14 @@ color indexes per byte, high nibble first. Source images can be packed as either
 from __future__ import annotations
 
 import argparse
+import glob
+import os
 import struct
 import sys
 from pathlib import Path
 
 try:
-    from PIL import Image, ImageColor, ImageOps
+    from PIL import Image, ImageColor, ImageEnhance, ImageFilter, ImageOps
 except ImportError as exc:
     raise SystemExit("Pillow is required. Install it with: pip3 install Pillow") from exc
 
@@ -27,6 +29,7 @@ PORTRAIT_SIZE = (1200, 1600)
 NATIVE_WIDTH = 1200
 NATIVE_HEIGHT = 1600
 DATA_BYTES = NATIVE_WIDTH * NATIVE_HEIGHT // 2
+INPUT_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 ROTATION_BY_ORIENTATION = {
     "portrait": 0,
     "landscape": 1,
@@ -41,15 +44,49 @@ SPECTRA_PALETTE = [
     (0, 255, 0),      # 5 green
 ]
 
+DIFFUSION_KERNELS = {
+    "floyd-steinberg": (
+        16,
+        [(1, 0, 7), (-1, 1, 3), (0, 1, 5), (1, 1, 1)],
+    ),
+    "atkinson": (
+        8,
+        [(1, 0, 1), (2, 0, 1), (-1, 1, 1), (0, 1, 1), (1, 1, 1), (0, 2, 1)],
+    ),
+    "stucki": (
+        42,
+        [
+            (1, 0, 8),
+            (2, 0, 4),
+            (-2, 1, 2),
+            (-1, 1, 4),
+            (0, 1, 8),
+            (1, 1, 4),
+            (2, 1, 2),
+            (-2, 2, 1),
+            (-1, 2, 2),
+            (0, 2, 4),
+            (1, 2, 2),
+            (2, 2, 1),
+        ],
+    ),
+}
+
+_NEAREST_PALETTE_LUT: bytearray | None = None
+
 
 def build_palette_image() -> Image.Image:
+    pal = Image.new("P", (1, 1))
+    pal.putpalette(palette_values())
+    return pal
+
+
+def palette_values() -> list[int]:
     palette = []
     for rgb in SPECTRA_PALETTE:
         palette.extend(rgb)
     palette.extend([255, 255, 255] * (256 - len(SPECTRA_PALETTE)))
-    pal = Image.new("P", (1, 1))
-    pal.putpalette(palette)
-    return pal
+    return palette
 
 
 def choose_orientation(image: Image.Image, requested: str) -> str:
@@ -60,6 +97,114 @@ def choose_orientation(image: Image.Image, requested: str) -> str:
 
 def target_size_for_orientation(orientation: str) -> tuple[int, int]:
     return PORTRAIT_SIZE if orientation == "portrait" else LANDSCAPE_SIZE
+
+
+def expand_path(value: str | Path) -> Path:
+    return Path(os.path.expandvars(os.path.expanduser(str(value))))
+
+
+def has_glob(value: str) -> bool:
+    return any(ch in value for ch in "*?[")
+
+
+def is_supported_input(path: Path) -> bool:
+    return path.suffix.lower() in INPUT_EXTENSIONS
+
+
+def split_legacy_output(inputs: list[str], output: str | None) -> tuple[list[str], str | None]:
+    """Keep the old `script input.jpg output.bin` command working."""
+
+    if output is not None or len(inputs) != 2:
+        return inputs, output
+
+    first = expand_path(inputs[0])
+    second = expand_path(inputs[1])
+    if not has_glob(inputs[0]) and not first.is_dir() and second.suffix.lower() == ".bin":
+        return [inputs[0]], inputs[1]
+    return inputs, output
+
+
+def collect_input_files(inputs: list[str], recursive: bool) -> list[Path]:
+    files: list[Path] = []
+
+    for raw in inputs:
+        expanded_raw = os.path.expandvars(os.path.expanduser(raw))
+        if has_glob(expanded_raw):
+            matches = [Path(match) for match in glob.glob(expanded_raw, recursive=recursive)]
+            if not matches:
+                raise FileNotFoundError(f"No files matched {raw}")
+            files.extend(path for path in matches if path.is_file() and is_supported_input(path))
+            continue
+
+        path = Path(expanded_raw)
+        if path.is_dir():
+            pattern = "**/*" if recursive else "*"
+            files.extend(child for child in path.glob(pattern) if child.is_file() and is_supported_input(child))
+            continue
+
+        if path.is_file() and is_supported_input(path):
+            files.append(path)
+            continue
+
+        if path.exists():
+            raise ValueError(f"Unsupported input type or extension: {path}")
+        raise FileNotFoundError(f"Input not found: {path}")
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in files:
+        key = str(path.resolve())
+        if key not in seen:
+            unique.append(path)
+            seen.add(key)
+
+    return sorted(unique, key=lambda p: str(p).lower())
+
+
+def input_specs_are_batch(inputs: list[str], output: str | None, output_dir: str | None) -> bool:
+    if output_dir is not None:
+        return True
+    if output is not None and expand_path(output).suffix.lower() != ".bin":
+        return True
+    if len(inputs) > 1:
+        return True
+    if not inputs:
+        return False
+
+    raw = inputs[0]
+    return has_glob(raw) or expand_path(raw).is_dir()
+
+
+def output_path_for(input_path: Path, output: str | None, output_dir: str | None, input_count: int) -> Path:
+    if output_dir:
+        return expand_path(output_dir) / input_path.with_suffix(".bin").name
+
+    if output:
+        resolved = expand_path(output)
+        if input_count == 1 and resolved.suffix.lower() == ".bin":
+            return resolved
+        return resolved / input_path.with_suffix(".bin").name
+
+    return input_path.with_suffix(".bin")
+
+
+def preview_path_for(input_path: Path, preview: str | None, input_count: int) -> Path | None:
+    if not preview:
+        return None
+
+    resolved = expand_path(preview)
+    if input_count == 1 and resolved.suffix.lower() in {".png", ".jpg", ".jpeg"}:
+        return resolved
+    return resolved / f"{input_path.stem}_preview.png"
+
+
+def open_rgb(path: Path, background: tuple[int, int, int]) -> Image.Image:
+    image = ImageOps.exif_transpose(Image.open(path))
+    if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
+        rgba = image.convert("RGBA")
+        canvas = Image.new("RGBA", rgba.size, (*background, 255))
+        return Image.alpha_composite(canvas, rgba).convert("RGB")
+    return image.convert("RGB")
 
 
 def fit_image(
@@ -74,7 +219,8 @@ def fit_image(
     if fit == "stretch":
         return image.resize(target, Image.Resampling.LANCZOS)
 
-    image.thumbnail(target, Image.Resampling.LANCZOS)
+    image = image.copy()
+    image.thumbnail(target, Image.Resampling.LANCZOS, reducing_gap=3.0)
     canvas = Image.new("RGB", target, background)
     x = (target[0] - image.width) // 2
     y = (target[1] - image.height) // 2
@@ -82,22 +228,178 @@ def fit_image(
     return canvas
 
 
-def quantize_to_spectra(image: Image.Image, dither: bool) -> Image.Image:
-    dither_mode = Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE
-    return image.quantize(palette=build_palette_image(), dither=dither_mode)
+def adjust_image(
+    image: Image.Image,
+    brightness: float,
+    contrast: float,
+    saturation: float,
+    sharpen: float,
+    autocontrast: bool,
+    autocontrast_cutoff: float,
+) -> Image.Image:
+    if autocontrast:
+        image = ImageOps.autocontrast(image, cutoff=autocontrast_cutoff)
+    if brightness != 1.0:
+        image = ImageEnhance.Brightness(image).enhance(brightness)
+    if contrast != 1.0:
+        image = ImageEnhance.Contrast(image).enhance(contrast)
+    if saturation != 1.0:
+        image = ImageEnhance.Color(image).enhance(saturation)
+    if sharpen > 0:
+        image = image.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(sharpen * 100), threshold=2))
+    return image
+
+
+def srgb_to_linear(value: float) -> float:
+    value /= 255.0
+    if value <= 0.04045:
+        return value / 12.92
+    return ((value + 0.055) / 1.055) ** 2.4
+
+
+def xyz_to_lab_component(value: float) -> float:
+    if value > 0.008856:
+        return value ** (1.0 / 3.0)
+    return 7.787 * value + 16.0 / 116.0
+
+
+def rgb_to_lab(rgb: tuple[int, int, int]) -> tuple[float, float, float]:
+    r = srgb_to_linear(rgb[0])
+    g = srgb_to_linear(rgb[1])
+    b = srgb_to_linear(rgb[2])
+
+    x = r * 0.4124564 + g * 0.3575761 + b * 0.1804375
+    y = r * 0.2126729 + g * 0.7151522 + b * 0.0721750
+    z = r * 0.0193339 + g * 0.1191920 + b * 0.9503041
+
+    fx = xyz_to_lab_component(x / 0.95047)
+    fy = xyz_to_lab_component(y)
+    fz = xyz_to_lab_component(z / 1.08883)
+    return 116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)
+
+
+def build_nearest_palette_lut() -> bytearray:
+    palette_lab = [rgb_to_lab(rgb) for rgb in SPECTRA_PALETTE]
+    lut = bytearray(32 * 32 * 32)
+
+    for ri in range(32):
+        r = 255 if ri == 31 else ri * 8 + 4
+        for gi in range(32):
+            g = 255 if gi == 31 else gi * 8 + 4
+            for bi in range(32):
+                b = 255 if bi == 31 else bi * 8 + 4
+                lab = rgb_to_lab((r, g, b))
+                best_index = 0
+                best_distance = float("inf")
+                for index, pal_lab in enumerate(palette_lab):
+                    dl = lab[0] - pal_lab[0]
+                    da = lab[1] - pal_lab[1]
+                    db = lab[2] - pal_lab[2]
+                    distance = dl * dl + da * da + db * db
+                    if distance < best_distance:
+                        best_distance = distance
+                        best_index = index
+                lut[(ri << 10) | (gi << 5) | bi] = best_index
+
+    return lut
+
+
+def nearest_palette_lut() -> bytearray:
+    global _NEAREST_PALETTE_LUT
+    if _NEAREST_PALETTE_LUT is None:
+        _NEAREST_PALETTE_LUT = build_nearest_palette_lut()
+    return _NEAREST_PALETTE_LUT
+
+
+def clamp_byte(value: float) -> int:
+    if value <= 0:
+        return 0
+    if value >= 255:
+        return 255
+    return int(value + 0.5)
+
+
+def palette_index_for_rgb(r: int, g: int, b: int) -> int:
+    return nearest_palette_lut()[((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)]
+
+
+def indexed_image_from_bytes(indices: bytes | bytearray, size: tuple[int, int]) -> Image.Image:
+    image = Image.frombytes("P", size, bytes(indices))
+    image.putpalette(palette_values())
+    return image
+
+
+def nearest_palette_quantize(image: Image.Image) -> Image.Image:
+    data = image.tobytes()
+    out = bytearray(image.width * image.height)
+    for pixel in range(image.width * image.height):
+        base = pixel * 3
+        out[pixel] = palette_index_for_rgb(data[base], data[base + 1], data[base + 2])
+    return indexed_image_from_bytes(out, image.size)
+
+
+def error_diffusion_quantize(image: Image.Image, kernel_name: str) -> Image.Image:
+    denominator, kernel = DIFFUSION_KERNELS[kernel_name]
+    max_dy = max(dy for _, dy, _ in kernel)
+    width, height = image.size
+    data = image.tobytes()
+    out = bytearray(width * height)
+    error_rows = [[0.0] * (width * 3) for _ in range(max_dy + 1)]
+
+    for y in range(height):
+        current_errors = error_rows[0]
+        for x in range(width):
+            base = (y * width + x) * 3
+            error_offset = x * 3
+            r = clamp_byte(data[base] + current_errors[error_offset])
+            g = clamp_byte(data[base + 1] + current_errors[error_offset + 1])
+            b = clamp_byte(data[base + 2] + current_errors[error_offset + 2])
+
+            index = palette_index_for_rgb(r, g, b)
+            out[y * width + x] = index
+
+            pal_r, pal_g, pal_b = SPECTRA_PALETTE[index]
+            err_r = r - pal_r
+            err_g = g - pal_g
+            err_b = b - pal_b
+
+            for dx, dy, weight in kernel:
+                nx = x + dx
+                if nx < 0 or nx >= width or y + dy >= height:
+                    continue
+
+                target = error_rows[dy]
+                target_offset = nx * 3
+                factor = weight / denominator
+                target[target_offset] += err_r * factor
+                target[target_offset + 1] += err_g * factor
+                target[target_offset + 2] += err_b * factor
+
+        error_rows.pop(0)
+        error_rows.append([0.0] * (width * 3))
+
+    return indexed_image_from_bytes(out, image.size)
+
+
+def quantize_to_spectra(image: Image.Image, dither: str) -> Image.Image:
+    if dither == "none":
+        return nearest_palette_quantize(image)
+    if dither == "pillow":
+        return image.quantize(palette=build_palette_image(), dither=Image.Dither.FLOYDSTEINBERG)
+    return error_diffusion_quantize(image, dither)
 
 
 def pack_native_frame(logical: Image.Image, orientation: str) -> bytes:
     """Map the logical view to the framebuffer used by the matching sketch rotation."""
 
-    pixels = logical.load()
+    pixels = logical.tobytes()
     logical_width, logical_height = logical.size
     out = bytearray(DATA_BYTES)
     rotation = ROTATION_BY_ORIENTATION[orientation]
 
     for y in range(logical_height):
         for x in range(logical_width):
-            color = pixels[x, y] & 0x0F
+            color = pixels[y * logical_width + x] & 0x0F
 
             if rotation == 1:
                 # Landscape uses sketch rotation 1:
@@ -142,13 +444,29 @@ def write_bin(output: Path, payload: bytes, logical_size: tuple[int, int], orien
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input", type=Path, help="Input image, for example JPG, PNG, or BMP.")
-    parser.add_argument("output", type=Path, nargs="?", help="Output .bin path. Defaults beside the input image.")
+    parser.add_argument(
+        "inputs",
+        nargs="+",
+        help="Input image files, directories, or glob patterns. Paths may be absolute, relative, or start with ~.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="Output .bin path for one input, or output directory for batch input.",
+    )
+    parser.add_argument("--output-dir", help="Output directory for batch conversion.")
+    parser.add_argument("--recursive", action="store_true", help="Recursively scan input directories.")
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip outputs that already exist. Batch conversion skips existing outputs by default.",
+    )
+    parser.add_argument("--force", action="store_true", help="Overwrite existing outputs in batch conversion.")
     parser.add_argument(
         "--fit",
         choices=("cover", "contain", "stretch"),
-        default="cover",
-        help="Resize mode. cover crops to fill the frame and usually looks best.",
+        default="contain",
+        help="Resize mode. contain preserves the full image; cover crops to fill the frame.",
     )
     parser.add_argument(
         "--background",
@@ -161,30 +479,96 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Output orientation. auto chooses portrait for taller source images.",
     )
-    parser.add_argument("--no-dither", action="store_true", help="Disable Floyd-Steinberg palette dithering.")
-    parser.add_argument("--preview", type=Path, help="Optional PNG preview of the six-color result.")
+    parser.add_argument(
+        "--dither",
+        choices=("stucki", "floyd-steinberg", "atkinson", "pillow", "none"),
+        default="stucki",
+        help="Palette dithering method. stucki is the default quality-oriented renderer.",
+    )
+    parser.add_argument("--no-dither", action="store_true", help="Alias for --dither none.")
+    parser.add_argument("--brightness", type=float, default=1.0, help="Brightness multiplier before quantization.")
+    parser.add_argument("--contrast", type=float, default=1.0, help="Contrast multiplier before quantization.")
+    parser.add_argument("--saturation", type=float, default=1.0, help="Saturation multiplier before quantization.")
+    parser.add_argument(
+        "--sharpen",
+        type=float,
+        default=0.35,
+        help="Unsharp-mask strength after resize. Use 0 to disable.",
+    )
+    parser.add_argument("--autocontrast", action="store_true", help="Apply light autocontrast before quantization.")
+    parser.add_argument(
+        "--autocontrast-cutoff",
+        type=float,
+        default=0.5,
+        help="Percent clipped at each end when --autocontrast is used.",
+    )
+    parser.add_argument("--preview", help="Optional preview PNG path for one input, or preview directory for batch.")
     return parser.parse_args()
+
+
+def convert_one(input_path: Path, output_path: Path, preview_path: Path | None, args: argparse.Namespace) -> None:
+    background = ImageColor.getrgb(args.background)
+    image = open_rgb(input_path, background)
+    orientation = choose_orientation(image, args.orientation)
+    target = target_size_for_orientation(orientation)
+    fitted = fit_image(image, target, args.fit, background)
+    adjusted = adjust_image(
+        fitted,
+        brightness=args.brightness,
+        contrast=args.contrast,
+        saturation=args.saturation,
+        sharpen=args.sharpen,
+        autocontrast=args.autocontrast,
+        autocontrast_cutoff=args.autocontrast_cutoff,
+    )
+    quantized = quantize_to_spectra(adjusted, dither=args.dither)
+
+    if preview_path:
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+        quantized.convert("RGB").save(preview_path)
+
+    payload = pack_native_frame(quantized, orientation)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    write_bin(output_path, payload, target, orientation)
+    print(f"Wrote {output_path} ({orientation}, {target[0]}x{target[1]}, {len(payload) + 32} bytes)")
 
 
 def main() -> int:
     args = parse_args()
-    output = args.output or args.input.with_suffix(".bin")
-    background = ImageColor.getrgb(args.background)
+    args.inputs, args.output = split_legacy_output(args.inputs, args.output)
+    if args.no_dither:
+        args.dither = "none"
 
-    image = ImageOps.exif_transpose(Image.open(args.input)).convert("RGB")
-    orientation = choose_orientation(image, args.orientation)
-    target = target_size_for_orientation(orientation)
-    fitted = fit_image(image, target, args.fit, background)
-    quantized = quantize_to_spectra(fitted, dither=not args.no_dither)
+    input_files = collect_input_files(args.inputs, recursive=args.recursive)
+    if not input_files:
+        raise SystemExit("No supported input images found.")
 
-    if args.preview:
-        args.preview.parent.mkdir(parents=True, exist_ok=True)
-        quantized.convert("RGB").save(args.preview)
+    batch_mode = input_specs_are_batch(args.inputs, args.output, args.output_dir)
+    should_skip_existing = False if args.force else args.skip_existing or batch_mode
+    converted = 0
+    skipped = 0
+    failed = 0
 
-    payload = pack_native_frame(quantized, orientation)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    write_bin(output, payload, target, orientation)
-    print(f"Wrote {output} ({orientation}, {target[0]}x{target[1]}, {len(payload) + 32} bytes)")
+    for input_path in input_files:
+        output_path = output_path_for(input_path, args.output, args.output_dir, len(input_files))
+        preview_path = preview_path_for(input_path, args.preview, len(input_files))
+
+        if should_skip_existing and output_path.exists():
+            print(f"Skipped existing {output_path}")
+            skipped += 1
+            continue
+
+        try:
+            convert_one(input_path, output_path, preview_path, args)
+            converted += 1
+        except Exception as exc:
+            failed += 1
+            print(f"Failed {input_path}: {exc}", file=sys.stderr)
+
+    if len(input_files) > 1:
+        print(f"Summary: converted={converted}, skipped={skipped}, failed={failed}")
+    if failed:
+        return 1
     return 0
 
 
