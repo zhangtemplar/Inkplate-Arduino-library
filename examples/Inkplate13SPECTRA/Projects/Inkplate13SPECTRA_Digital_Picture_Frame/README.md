@@ -69,3 +69,13 @@ python3 tools/convert_to_inkplate13spectra_bin.py "./photos/*.jpg" --output-dir 
 ```
 
 The converter defaults to `--orientation auto`, using a 1600x1200 landscape canvas for wide images and a 1200x1600 portrait canvas for tall images. It now defaults to `--fit contain` so artwork is not cropped; use `--fit cover` when you prefer full-screen crop. It resizes with Lanczos, applies light sharpening, uses Stucki error diffusion into the six Spectra colors, then stores the packed native framebuffer for fast, high-quality display. Runtime JPG/PNG/BMP rendering is a fallback path; it does not perform high-quality aspect-fit resizing and cannot match the converter's output.
+
+For best color matching, measure your exact panel and viewing light with `panel_profile.py`, then pass the generated JSON profile:
+
+```sh
+python3 panel_profile.py chart --width 1200 --height 1600 -o chart.png
+python3 panel_profile.py measure --panel panel.ARW --checker checker.ARW -o spectra6_profile.json
+python3 tools/convert_to_inkplate13spectra_bin.py ~/Pictures/frame --recursive --panel-profile spectra6_profile.json
+```
+
+The profile replaces ideal RGB primaries with measured Spectra 6 ink colors during quantization and preview generation. The packed `.bin` still uses the Inkplate hardware index order: black, white, yellow, red, blue, green.

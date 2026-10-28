@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import struct
 import sys
@@ -30,19 +31,20 @@ NATIVE_WIDTH = 1200
 NATIVE_HEIGHT = 1600
 DATA_BYTES = NATIVE_WIDTH * NATIVE_HEIGHT // 2
 INPUT_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+PANEL_PALETTE_ORDER = ("black", "white", "yellow", "red", "blue", "green")
 ROTATION_BY_ORIENTATION = {
     "portrait": 0,
     "landscape": 1,
 }
 
-SPECTRA_PALETTE = [
-    (0, 0, 0),        # 0 black
-    (255, 255, 255),  # 1 white
-    (255, 255, 0),    # 2 yellow
-    (255, 0, 0),      # 3 red
-    (0, 0, 255),      # 4 blue
-    (0, 255, 0),      # 5 green
-]
+NOMINAL_SPECTRA_PALETTE = {
+    "black": (0, 0, 0),
+    "white": (255, 255, 255),
+    "yellow": (255, 255, 0),
+    "red": (255, 0, 0),
+    "blue": (0, 0, 255),
+    "green": (0, 255, 0),
+}
 
 DIFFUSION_KERNELS = {
     "floyd-steinberg": (
@@ -72,21 +74,64 @@ DIFFUSION_KERNELS = {
     ),
 }
 
-_NEAREST_PALETTE_LUT: bytearray | None = None
-
-
-def build_palette_image() -> Image.Image:
+def build_palette_image(palette_rgb: list[tuple[int, int, int]]) -> Image.Image:
     pal = Image.new("P", (1, 1))
-    pal.putpalette(palette_values())
+    pal.putpalette(palette_values(palette_rgb))
     return pal
 
 
-def palette_values() -> list[int]:
+def palette_values(palette_rgb: list[tuple[int, int, int]]) -> list[int]:
     palette = []
-    for rgb in SPECTRA_PALETTE:
+    for rgb in palette_rgb:
         palette.extend(rgb)
-    palette.extend([255, 255, 255] * (256 - len(SPECTRA_PALETTE)))
+    palette.extend([255, 255, 255] * (256 - len(palette_rgb)))
     return palette
+
+
+def nominal_palette_rgb() -> list[tuple[int, int, int]]:
+    return [NOMINAL_SPECTRA_PALETTE[name] for name in PANEL_PALETTE_ORDER]
+
+
+def load_panel_palette(profile_path: str | None) -> tuple[list[tuple[int, int, int]], list[tuple[float, float, float]]]:
+    """Load measured panel primaries from panel_profile.py's JSON output."""
+
+    if not profile_path:
+        palette_rgb = nominal_palette_rgb()
+        return palette_rgb, [rgb_to_lab(rgb) for rgb in palette_rgb]
+
+    path = expand_path(profile_path)
+    if path.suffix.lower() == ".py":
+        raise ValueError(
+            "--panel-profile expects the measured JSON output from panel_profile.py, "
+            "for example spectra6_profile.json, not panel_profile.py itself."
+        )
+
+    profile = json.loads(path.read_text())
+    primaries = {str(primary["name"]).lower(): primary for primary in profile.get("primaries", [])}
+
+    missing = [name for name in PANEL_PALETTE_ORDER if name not in primaries]
+    if missing:
+        raise ValueError(f"Panel profile is missing primaries: {', '.join(missing)}")
+
+    palette_rgb: list[tuple[int, int, int]] = []
+    palette_lab: list[tuple[float, float, float]] = []
+    for name in PANEL_PALETTE_ORDER:
+        primary = primaries[name]
+        rgb = primary.get("srgb8") or primary.get("nominal_srgb8") or NOMINAL_SPECTRA_PALETTE[name]
+        lab = primary.get("Lab_D65")
+
+        if len(rgb) != 3:
+            raise ValueError(f"Panel profile primary {name} has invalid srgb8")
+        palette_rgb.append(tuple(max(0, min(255, int(round(channel)))) for channel in rgb))
+
+        if lab is not None:
+            if len(lab) != 3:
+                raise ValueError(f"Panel profile primary {name} has invalid Lab_D65")
+            palette_lab.append(tuple(float(channel) for channel in lab))
+        else:
+            palette_lab.append(rgb_to_lab(palette_rgb[-1]))
+
+    return palette_rgb, palette_lab
 
 
 def choose_orientation(image: Image.Image, requested: str) -> str:
@@ -278,8 +323,7 @@ def rgb_to_lab(rgb: tuple[int, int, int]) -> tuple[float, float, float]:
     return 116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)
 
 
-def build_nearest_palette_lut() -> bytearray:
-    palette_lab = [rgb_to_lab(rgb) for rgb in SPECTRA_PALETTE]
+def build_nearest_palette_lut(palette_lab: list[tuple[float, float, float]]) -> bytearray:
     lut = bytearray(32 * 32 * 32)
 
     for ri in range(32):
@@ -304,13 +348,6 @@ def build_nearest_palette_lut() -> bytearray:
     return lut
 
 
-def nearest_palette_lut() -> bytearray:
-    global _NEAREST_PALETTE_LUT
-    if _NEAREST_PALETTE_LUT is None:
-        _NEAREST_PALETTE_LUT = build_nearest_palette_lut()
-    return _NEAREST_PALETTE_LUT
-
-
 def clamp_byte(value: float) -> int:
     if value <= 0:
         return 0
@@ -319,26 +356,39 @@ def clamp_byte(value: float) -> int:
     return int(value + 0.5)
 
 
-def palette_index_for_rgb(r: int, g: int, b: int) -> int:
-    return nearest_palette_lut()[((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)]
+def palette_index_for_rgb(r: int, g: int, b: int, palette_lut: bytearray) -> int:
+    return palette_lut[((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)]
 
 
-def indexed_image_from_bytes(indices: bytes | bytearray, size: tuple[int, int]) -> Image.Image:
+def indexed_image_from_bytes(
+    indices: bytes | bytearray,
+    size: tuple[int, int],
+    palette_rgb: list[tuple[int, int, int]],
+) -> Image.Image:
     image = Image.frombytes("P", size, bytes(indices))
-    image.putpalette(palette_values())
+    image.putpalette(palette_values(palette_rgb))
     return image
 
 
-def nearest_palette_quantize(image: Image.Image) -> Image.Image:
+def nearest_palette_quantize(
+    image: Image.Image,
+    palette_rgb: list[tuple[int, int, int]],
+    palette_lut: bytearray,
+) -> Image.Image:
     data = image.tobytes()
     out = bytearray(image.width * image.height)
     for pixel in range(image.width * image.height):
         base = pixel * 3
-        out[pixel] = palette_index_for_rgb(data[base], data[base + 1], data[base + 2])
-    return indexed_image_from_bytes(out, image.size)
+        out[pixel] = palette_index_for_rgb(data[base], data[base + 1], data[base + 2], palette_lut)
+    return indexed_image_from_bytes(out, image.size, palette_rgb)
 
 
-def error_diffusion_quantize(image: Image.Image, kernel_name: str) -> Image.Image:
+def error_diffusion_quantize(
+    image: Image.Image,
+    kernel_name: str,
+    palette_rgb: list[tuple[int, int, int]],
+    palette_lut: bytearray,
+) -> Image.Image:
     denominator, kernel = DIFFUSION_KERNELS[kernel_name]
     max_dy = max(dy for _, dy, _ in kernel)
     width, height = image.size
@@ -355,10 +405,10 @@ def error_diffusion_quantize(image: Image.Image, kernel_name: str) -> Image.Imag
             g = clamp_byte(data[base + 1] + current_errors[error_offset + 1])
             b = clamp_byte(data[base + 2] + current_errors[error_offset + 2])
 
-            index = palette_index_for_rgb(r, g, b)
+            index = palette_index_for_rgb(r, g, b, palette_lut)
             out[y * width + x] = index
 
-            pal_r, pal_g, pal_b = SPECTRA_PALETTE[index]
+            pal_r, pal_g, pal_b = palette_rgb[index]
             err_r = r - pal_r
             err_g = g - pal_g
             err_b = b - pal_b
@@ -378,15 +428,20 @@ def error_diffusion_quantize(image: Image.Image, kernel_name: str) -> Image.Imag
         error_rows.pop(0)
         error_rows.append([0.0] * (width * 3))
 
-    return indexed_image_from_bytes(out, image.size)
+    return indexed_image_from_bytes(out, image.size, palette_rgb)
 
 
-def quantize_to_spectra(image: Image.Image, dither: str) -> Image.Image:
+def quantize_to_spectra(
+    image: Image.Image,
+    dither: str,
+    palette_rgb: list[tuple[int, int, int]],
+    palette_lut: bytearray,
+) -> Image.Image:
     if dither == "none":
-        return nearest_palette_quantize(image)
+        return nearest_palette_quantize(image, palette_rgb, palette_lut)
     if dither == "pillow":
-        return image.quantize(palette=build_palette_image(), dither=Image.Dither.FLOYDSTEINBERG)
-    return error_diffusion_quantize(image, dither)
+        return image.quantize(palette=build_palette_image(palette_rgb), dither=Image.Dither.FLOYDSTEINBERG)
+    return error_diffusion_quantize(image, dither, palette_rgb, palette_lut)
 
 
 def pack_native_frame(logical: Image.Image, orientation: str) -> bytes:
@@ -430,7 +485,7 @@ def write_bin(output: Path, payload: bytes, logical_size: tuple[int, int], orien
         MAGIC,
         VERSION,
         flags,
-        len(SPECTRA_PALETTE),
+        len(PANEL_PALETTE_ORDER),
         0,
         logical_size[0],
         logical_size[1],
@@ -480,6 +535,10 @@ def parse_args() -> argparse.Namespace:
         help="Output orientation. auto chooses portrait for taller source images.",
     )
     parser.add_argument(
+        "--panel-profile",
+        help="Measured JSON profile from panel_profile.py. Uses real Spectra 6 primary colors for quantization.",
+    )
+    parser.add_argument(
         "--dither",
         choices=("stucki", "floyd-steinberg", "atkinson", "pillow", "none"),
         default="stucki",
@@ -506,7 +565,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def convert_one(input_path: Path, output_path: Path, preview_path: Path | None, args: argparse.Namespace) -> None:
+def convert_one(
+    input_path: Path,
+    output_path: Path,
+    preview_path: Path | None,
+    args: argparse.Namespace,
+    palette_rgb: list[tuple[int, int, int]],
+    palette_lut: bytearray,
+) -> None:
     background = ImageColor.getrgb(args.background)
     image = open_rgb(input_path, background)
     orientation = choose_orientation(image, args.orientation)
@@ -521,7 +587,7 @@ def convert_one(input_path: Path, output_path: Path, preview_path: Path | None, 
         autocontrast=args.autocontrast,
         autocontrast_cutoff=args.autocontrast_cutoff,
     )
-    quantized = quantize_to_spectra(adjusted, dither=args.dither)
+    quantized = quantize_to_spectra(adjusted, dither=args.dither, palette_rgb=palette_rgb, palette_lut=palette_lut)
 
     if preview_path:
         preview_path.parent.mkdir(parents=True, exist_ok=True)
@@ -543,6 +609,9 @@ def main() -> int:
     if not input_files:
         raise SystemExit("No supported input images found.")
 
+    palette_rgb, palette_lab = load_panel_palette(args.panel_profile)
+    palette_lut = build_nearest_palette_lut(palette_lab)
+
     batch_mode = input_specs_are_batch(args.inputs, args.output, args.output_dir)
     should_skip_existing = False if args.force else args.skip_existing or batch_mode
     converted = 0
@@ -559,7 +628,7 @@ def main() -> int:
             continue
 
         try:
-            convert_one(input_path, output_path, preview_path, args)
+            convert_one(input_path, output_path, preview_path, args, palette_rgb, palette_lut)
             converted += 1
         except Exception as exc:
             failed += 1
