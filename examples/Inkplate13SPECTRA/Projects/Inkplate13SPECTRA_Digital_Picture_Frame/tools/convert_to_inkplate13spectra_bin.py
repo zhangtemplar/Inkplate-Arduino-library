@@ -32,6 +32,14 @@ NATIVE_HEIGHT = 1600
 DATA_BYTES = NATIVE_WIDTH * NATIVE_HEIGHT // 2
 INPUT_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 PANEL_PALETTE_ORDER = ("black", "white", "yellow", "red", "blue", "green")
+DEFAULT_FIT = "contain"
+DEFAULT_DITHER = "stucki"
+DEFAULT_BRIGHTNESS = 1.0
+DEFAULT_CONTRAST = 1.10
+DEFAULT_SATURATION = 1.16
+DEFAULT_SHARPEN = 0.50
+DEFAULT_DIFFUSION_STRENGTH = 0.60
+DEFAULT_NEUTRAL_THRESHOLD = 18
 ROTATION_BY_ORIENTATION = {
     "portrait": 0,
     "landscape": 1,
@@ -323,7 +331,11 @@ def rgb_to_lab(rgb: tuple[int, int, int]) -> tuple[float, float, float]:
     return 116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)
 
 
-def build_nearest_palette_lut(palette_lab: list[tuple[float, float, float]]) -> bytearray:
+def build_nearest_palette_lut(
+    palette_lab: list[tuple[float, float, float]],
+    allowed_indexes: tuple[int, ...] | None = None,
+) -> bytearray:
+    indexes = allowed_indexes or tuple(range(len(palette_lab)))
     lut = bytearray(32 * 32 * 32)
 
     for ri in range(32):
@@ -333,9 +345,10 @@ def build_nearest_palette_lut(palette_lab: list[tuple[float, float, float]]) -> 
             for bi in range(32):
                 b = 255 if bi == 31 else bi * 8 + 4
                 lab = rgb_to_lab((r, g, b))
-                best_index = 0
+                best_index = indexes[0]
                 best_distance = float("inf")
-                for index, pal_lab in enumerate(palette_lab):
+                for index in indexes:
+                    pal_lab = palette_lab[index]
                     dl = lab[0] - pal_lab[0]
                     da = lab[1] - pal_lab[1]
                     db = lab[2] - pal_lab[2]
@@ -370,16 +383,29 @@ def indexed_image_from_bytes(
     return image
 
 
+def is_neutral_rgb(r: int, g: int, b: int, neutral_threshold: int) -> bool:
+    return neutral_threshold > 0 and max(r, g, b) - min(r, g, b) <= neutral_threshold
+
+
+def neutralize_error(err_r: int | float, err_g: int | float, err_b: int | float) -> tuple[float, float, float]:
+    gray_error = (float(err_r) + float(err_g) + float(err_b)) / 3.0
+    return gray_error, gray_error, gray_error
+
+
 def nearest_palette_quantize(
     image: Image.Image,
     palette_rgb: list[tuple[int, int, int]],
     palette_lut: bytearray,
+    neutral_lut: bytearray,
+    neutral_threshold: int,
 ) -> Image.Image:
     data = image.tobytes()
     out = bytearray(image.width * image.height)
     for pixel in range(image.width * image.height):
         base = pixel * 3
-        out[pixel] = palette_index_for_rgb(data[base], data[base + 1], data[base + 2], palette_lut)
+        r, g, b = data[base], data[base + 1], data[base + 2]
+        lut = neutral_lut if is_neutral_rgb(r, g, b, neutral_threshold) else palette_lut
+        out[pixel] = palette_index_for_rgb(r, g, b, lut)
     return indexed_image_from_bytes(out, image.size, palette_rgb)
 
 
@@ -388,6 +414,10 @@ def error_diffusion_quantize(
     kernel_name: str,
     palette_rgb: list[tuple[int, int, int]],
     palette_lut: bytearray,
+    neutral_lut: bytearray,
+    neutral_threshold: int,
+    diffusion_strength: float,
+    serpentine: bool,
 ) -> Image.Image:
     denominator, kernel = DIFFUSION_KERNELS[kernel_name]
     max_dy = max(dy for _, dy, _ in kernel)
@@ -398,29 +428,37 @@ def error_diffusion_quantize(
 
     for y in range(height):
         current_errors = error_rows[0]
-        for x in range(width):
+        right_to_left = serpentine and (y & 1)
+        x_range = range(width - 1, -1, -1) if right_to_left else range(width)
+        x_direction = -1 if right_to_left else 1
+
+        for x in x_range:
             base = (y * width + x) * 3
             error_offset = x * 3
             r = clamp_byte(data[base] + current_errors[error_offset])
             g = clamp_byte(data[base + 1] + current_errors[error_offset + 1])
             b = clamp_byte(data[base + 2] + current_errors[error_offset + 2])
 
-            index = palette_index_for_rgb(r, g, b, palette_lut)
+            neutral = is_neutral_rgb(r, g, b, neutral_threshold)
+            lut = neutral_lut if neutral else palette_lut
+            index = palette_index_for_rgb(r, g, b, lut)
             out[y * width + x] = index
 
             pal_r, pal_g, pal_b = palette_rgb[index]
             err_r = r - pal_r
             err_g = g - pal_g
             err_b = b - pal_b
+            if neutral:
+                err_r, err_g, err_b = neutralize_error(err_r, err_g, err_b)
 
             for dx, dy, weight in kernel:
-                nx = x + dx
+                nx = x + dx * x_direction
                 if nx < 0 or nx >= width or y + dy >= height:
                     continue
 
                 target = error_rows[dy]
                 target_offset = nx * 3
-                factor = weight / denominator
+                factor = diffusion_strength * weight / denominator
                 target[target_offset] += err_r * factor
                 target[target_offset + 1] += err_g * factor
                 target[target_offset + 2] += err_b * factor
@@ -436,12 +474,25 @@ def quantize_to_spectra(
     dither: str,
     palette_rgb: list[tuple[int, int, int]],
     palette_lut: bytearray,
+    neutral_lut: bytearray,
+    neutral_threshold: int,
+    diffusion_strength: float,
+    serpentine: bool,
 ) -> Image.Image:
     if dither == "none":
-        return nearest_palette_quantize(image, palette_rgb, palette_lut)
+        return nearest_palette_quantize(image, palette_rgb, palette_lut, neutral_lut, neutral_threshold)
     if dither == "pillow":
         return image.quantize(palette=build_palette_image(palette_rgb), dither=Image.Dither.FLOYDSTEINBERG)
-    return error_diffusion_quantize(image, dither, palette_rgb, palette_lut)
+    return error_diffusion_quantize(
+        image,
+        dither,
+        palette_rgb,
+        palette_lut,
+        neutral_lut,
+        neutral_threshold,
+        diffusion_strength,
+        serpentine,
+    )
 
 
 def pack_native_frame(logical: Image.Image, orientation: str) -> bytes:
@@ -520,7 +571,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fit",
         choices=("cover", "contain", "stretch"),
-        default="contain",
+        default=DEFAULT_FIT,
         help="Resize mode. contain preserves the full image; cover crops to fill the frame.",
     )
     parser.add_argument(
@@ -541,18 +592,50 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dither",
         choices=("stucki", "floyd-steinberg", "atkinson", "pillow", "none"),
-        default="stucki",
+        default=DEFAULT_DITHER,
         help="Palette dithering method. stucki is the default quality-oriented renderer.",
     )
     parser.add_argument("--no-dither", action="store_true", help="Alias for --dither none.")
-    parser.add_argument("--brightness", type=float, default=1.0, help="Brightness multiplier before quantization.")
-    parser.add_argument("--contrast", type=float, default=1.0, help="Contrast multiplier before quantization.")
-    parser.add_argument("--saturation", type=float, default=1.0, help="Saturation multiplier before quantization.")
+    parser.add_argument(
+        "--brightness",
+        type=float,
+        default=DEFAULT_BRIGHTNESS,
+        help="Brightness multiplier before quantization.",
+    )
+    parser.add_argument(
+        "--contrast",
+        type=float,
+        default=DEFAULT_CONTRAST,
+        help="Contrast multiplier before quantization.",
+    )
+    parser.add_argument(
+        "--saturation",
+        type=float,
+        default=DEFAULT_SATURATION,
+        help="Saturation multiplier before quantization.",
+    )
     parser.add_argument(
         "--sharpen",
         type=float,
-        default=0.35,
+        default=DEFAULT_SHARPEN,
         help="Unsharp-mask strength after resize. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--diffusion-strength",
+        type=float,
+        default=DEFAULT_DIFFUSION_STRENGTH,
+        help="Scale error diffusion. Lower values look cleaner; 1.0 is mathematically stronger but noisier.",
+    )
+    parser.add_argument(
+        "--neutral-threshold",
+        type=int,
+        default=DEFAULT_NEUTRAL_THRESHOLD,
+        help="RGB max-min threshold for neutral pixels that should dither with black/white only. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--no-serpentine",
+        action="store_true",
+        help="Disable alternating left/right diffusion rows.",
     )
     parser.add_argument("--autocontrast", action="store_true", help="Apply light autocontrast before quantization.")
     parser.add_argument(
@@ -572,6 +655,7 @@ def convert_one(
     args: argparse.Namespace,
     palette_rgb: list[tuple[int, int, int]],
     palette_lut: bytearray,
+    neutral_lut: bytearray,
 ) -> None:
     background = ImageColor.getrgb(args.background)
     image = open_rgb(input_path, background)
@@ -587,7 +671,16 @@ def convert_one(
         autocontrast=args.autocontrast,
         autocontrast_cutoff=args.autocontrast_cutoff,
     )
-    quantized = quantize_to_spectra(adjusted, dither=args.dither, palette_rgb=palette_rgb, palette_lut=palette_lut)
+    quantized = quantize_to_spectra(
+        adjusted,
+        dither=args.dither,
+        palette_rgb=palette_rgb,
+        palette_lut=palette_lut,
+        neutral_lut=neutral_lut,
+        neutral_threshold=args.neutral_threshold,
+        diffusion_strength=args.diffusion_strength,
+        serpentine=not args.no_serpentine,
+    )
 
     if preview_path:
         preview_path.parent.mkdir(parents=True, exist_ok=True)
@@ -611,6 +704,7 @@ def main() -> int:
 
     palette_rgb, palette_lab = load_panel_palette(args.panel_profile)
     palette_lut = build_nearest_palette_lut(palette_lab)
+    neutral_lut = build_nearest_palette_lut(palette_lab, allowed_indexes=(0, 1))
 
     batch_mode = input_specs_are_batch(args.inputs, args.output, args.output_dir)
     should_skip_existing = False if args.force else args.skip_existing or batch_mode
@@ -628,7 +722,7 @@ def main() -> int:
             continue
 
         try:
-            convert_one(input_path, output_path, preview_path, args, palette_rgb, palette_lut)
+            convert_one(input_path, output_path, preview_path, args, palette_rgb, palette_lut, neutral_lut)
             converted += 1
         except Exception as exc:
             failed += 1
