@@ -1,0 +1,246 @@
+{
+  "schema": "spectra6-panel-profile/1",
+  "illuminant": "grey-card WB",
+  "fit": "diagonal-wb",
+  "panel_image": "IMG_8954.JPG",
+  "checker_image": null,
+  "flare_offset_camera_linear": [
+    0.0,
+    0.0,
+    0.0
+  ],
+  "notes": "Provisional profile generated from IMG_8954.JPG using the panel white patch as white reference; no ColorChecker was supplied.",
+  "primaries": [
+    {
+      "name": "black",
+      "index": 0,
+      "nominal_srgb8": [
+        0,
+        0,
+        0
+      ],
+      "XYZ_D65": [
+        0.075201,
+        0.073614,
+        0.105397
+      ],
+      "Lab_D65": [
+        32.616,
+        5.1,
+        -8.01
+      ],
+      "srgb_linear": [
+        0.077988,
+        0.06959,
+        0.100594
+      ],
+      "srgb8": [
+        79,
+        75,
+        89
+      ],
+      "srgb8_clipped": false,
+      "camera_linear_raw": [
+        0.039546,
+        0.031896,
+        0.035601
+      ]
+    },
+    {
+      "name": "white",
+      "index": 1,
+      "nominal_srgb8": [
+        255,
+        255,
+        255
+      ],
+      "XYZ_D65": [
+        0.855497,
+        0.900078,
+        0.980032
+      ],
+      "Lab_D65": [
+        96.0,
+        -0.0,
+        0.0
+      ],
+      "srgb_linear": [
+        0.900078,
+        0.900078,
+        0.900078
+      ],
+      "srgb8": [
+        243,
+        243,
+        243
+      ],
+      "srgb8_clipped": false,
+      "camera_linear_raw": [
+        0.456411,
+        0.412543,
+        0.318547
+      ]
+    },
+    {
+      "name": "yellow",
+      "index": 2,
+      "nominal_srgb8": [
+        255,
+        255,
+        0
+      ],
+      "XYZ_D65": [
+        0.710366,
+        0.730198,
+        0.329034
+      ],
+      "Lab_D65": [
+        88.457,
+        3.505,
+        45.887
+      ],
+      "srgb_linear": [
+        1.015458,
+        0.695,
+        0.238411
+      ],
+      "srgb8": [
+        255,
+        217,
+        134
+      ],
+      "srgb8_clipped": true,
+      "camera_linear_raw": [
+        0.514918,
+        0.318547,
+        0.084376
+      ]
+    },
+    {
+      "name": "red",
+      "index": 3,
+      "nominal_srgb8": [
+        255,
+        0,
+        0
+      ],
+      "XYZ_D65": [
+        0.220207,
+        0.159115,
+        0.101202
+      ],
+      "Lab_D65": [
+        46.858,
+        36.151,
+        17.781
+      ],
+      "srgb_linear": [
+        0.418535,
+        0.089268,
+        0.086783
+      ],
+      "srgb8": [
+        173,
+        84,
+        83
+      ],
+      "srgb8_clipped": false,
+      "camera_linear_raw": [
+        0.212231,
+        0.040915,
+        0.030713
+      ]
+    },
+    {
+      "name": "green",
+      "index": 4,
+      "nominal_srgb8": [
+        0,
+        255,
+        0
+      ],
+      "XYZ_D65": [
+        0.135071,
+        0.154563,
+        0.17273
+      ],
+      "Lab_D65": [
+        46.253,
+        -7.409,
+        -0.935
+      ],
+      "srgb_linear": [
+        0.113997,
+        0.16622,
+        0.158595
+      ],
+      "srgb8": [
+        95,
+        113,
+        111
+      ],
+      "srgb8_clipped": false,
+      "camera_linear_raw": [
+        0.057805,
+        0.076185,
+        0.056128
+      ]
+    },
+    {
+      "name": "blue",
+      "index": 5,
+      "nominal_srgb8": [
+        0,
+        0,
+        255
+      ],
+      "XYZ_D65": [
+        0.139107,
+        0.126321,
+        0.402259
+      ],
+      "Lab_D65": [
+        42.204,
+        12.618,
+        -43.158
+      ],
+      "srgb_linear": [
+        0.056058,
+        0.118864,
+        0.407246
+      ],
+      "srgb8": [
+        67,
+        97,
+        171
+      ],
+      "srgb8_clipped": false,
+      "camera_linear_raw": [
+        0.028426,
+        0.05448,
+        0.144128
+      ]
+    }
+  ],
+  "_debug": {
+    "panel_corners": [
+      [
+        742.0,
+        963.0
+      ],
+      [
+        2873.0,
+        956.0
+      ],
+      [
+        2878.0,
+        2079.0
+      ],
+      [
+        755.0,
+        2120.0
+      ]
+    ],
+    "checker": null
+  }
+}

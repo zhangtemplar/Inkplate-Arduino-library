@@ -38,8 +38,12 @@ DEFAULT_BRIGHTNESS = 1.0
 DEFAULT_CONTRAST = 1.10
 DEFAULT_SATURATION = 1.16
 DEFAULT_SHARPEN = 0.50
-DEFAULT_DIFFUSION_STRENGTH = 0.60
-DEFAULT_NEUTRAL_THRESHOLD = 18
+DEFAULT_DIFFUSION_STRENGTH = 0.40
+DEFAULT_CHROMA_DIFFUSION_STRENGTH = 0.20
+DEFAULT_NEUTRAL_THRESHOLD = 22
+DEFAULT_NEUTRAL_SATURATION = 0.20
+DEFAULT_SHADOW_NEUTRAL_MAX = 88
+DEFAULT_SHADOW_NEUTRAL_SATURATION = 0.42
 ROTATION_BY_ORIENTATION = {
     "portrait": 0,
     "landscape": 1,
@@ -383,13 +387,61 @@ def indexed_image_from_bytes(
     return image
 
 
-def is_neutral_rgb(r: int, g: int, b: int, neutral_threshold: int) -> bool:
-    return neutral_threshold > 0 and max(r, g, b) - min(r, g, b) <= neutral_threshold
+def rgb_saturation(r: int, g: int, b: int) -> float:
+    value = max(r, g, b)
+    if value <= 0:
+        return 0.0
+    return (value - min(r, g, b)) / value
+
+
+def is_neutral_rgb(
+    r: int,
+    g: int,
+    b: int,
+    neutral_threshold: int,
+    neutral_saturation: float,
+    shadow_neutral_max: int,
+    shadow_neutral_saturation: float,
+) -> bool:
+    chroma = max(r, g, b) - min(r, g, b)
+    if neutral_threshold > 0 and chroma <= neutral_threshold:
+        return True
+
+    saturation = rgb_saturation(r, g, b)
+    if neutral_saturation > 0 and saturation <= neutral_saturation:
+        return True
+
+    value = max(r, g, b)
+    return (
+        shadow_neutral_max > 0
+        and value <= shadow_neutral_max
+        and shadow_neutral_saturation > 0
+        and saturation <= shadow_neutral_saturation
+    )
 
 
 def neutralize_error(err_r: int | float, err_g: int | float, err_b: int | float) -> tuple[float, float, float]:
-    gray_error = (float(err_r) + float(err_g) + float(err_b)) / 3.0
+    gray_error = 0.299 * float(err_r) + 0.587 * float(err_g) + 0.114 * float(err_b)
     return gray_error, gray_error, gray_error
+
+
+def damp_chroma_error(
+    err_r: int | float,
+    err_g: int | float,
+    err_b: int | float,
+    chroma_strength: float,
+) -> tuple[float, float, float]:
+    if chroma_strength >= 0.999:
+        return float(err_r), float(err_g), float(err_b)
+    if chroma_strength <= 0:
+        return neutralize_error(err_r, err_g, err_b)
+
+    gray_error = 0.299 * float(err_r) + 0.587 * float(err_g) + 0.114 * float(err_b)
+    return (
+        gray_error + (float(err_r) - gray_error) * chroma_strength,
+        gray_error + (float(err_g) - gray_error) * chroma_strength,
+        gray_error + (float(err_b) - gray_error) * chroma_strength,
+    )
 
 
 def nearest_palette_quantize(
@@ -398,13 +450,28 @@ def nearest_palette_quantize(
     palette_lut: bytearray,
     neutral_lut: bytearray,
     neutral_threshold: int,
+    neutral_saturation: float,
+    shadow_neutral_max: int,
+    shadow_neutral_saturation: float,
 ) -> Image.Image:
     data = image.tobytes()
     out = bytearray(image.width * image.height)
     for pixel in range(image.width * image.height):
         base = pixel * 3
         r, g, b = data[base], data[base + 1], data[base + 2]
-        lut = neutral_lut if is_neutral_rgb(r, g, b, neutral_threshold) else palette_lut
+        lut = (
+            neutral_lut
+            if is_neutral_rgb(
+                r,
+                g,
+                b,
+                neutral_threshold,
+                neutral_saturation,
+                shadow_neutral_max,
+                shadow_neutral_saturation,
+            )
+            else palette_lut
+        )
         out[pixel] = palette_index_for_rgb(r, g, b, lut)
     return indexed_image_from_bytes(out, image.size, palette_rgb)
 
@@ -416,7 +483,11 @@ def error_diffusion_quantize(
     palette_lut: bytearray,
     neutral_lut: bytearray,
     neutral_threshold: int,
+    neutral_saturation: float,
+    shadow_neutral_max: int,
+    shadow_neutral_saturation: float,
     diffusion_strength: float,
+    chroma_diffusion_strength: float,
     serpentine: bool,
 ) -> Image.Image:
     denominator, kernel = DIFFUSION_KERNELS[kernel_name]
@@ -439,7 +510,15 @@ def error_diffusion_quantize(
             g = clamp_byte(data[base + 1] + current_errors[error_offset + 1])
             b = clamp_byte(data[base + 2] + current_errors[error_offset + 2])
 
-            neutral = is_neutral_rgb(r, g, b, neutral_threshold)
+            neutral = is_neutral_rgb(
+                r,
+                g,
+                b,
+                neutral_threshold,
+                neutral_saturation,
+                shadow_neutral_max,
+                shadow_neutral_saturation,
+            )
             lut = neutral_lut if neutral else palette_lut
             index = palette_index_for_rgb(r, g, b, lut)
             out[y * width + x] = index
@@ -450,6 +529,8 @@ def error_diffusion_quantize(
             err_b = b - pal_b
             if neutral:
                 err_r, err_g, err_b = neutralize_error(err_r, err_g, err_b)
+            else:
+                err_r, err_g, err_b = damp_chroma_error(err_r, err_g, err_b, chroma_diffusion_strength)
 
             for dx, dy, weight in kernel:
                 nx = x + dx * x_direction
@@ -476,11 +557,24 @@ def quantize_to_spectra(
     palette_lut: bytearray,
     neutral_lut: bytearray,
     neutral_threshold: int,
+    neutral_saturation: float,
+    shadow_neutral_max: int,
+    shadow_neutral_saturation: float,
     diffusion_strength: float,
+    chroma_diffusion_strength: float,
     serpentine: bool,
 ) -> Image.Image:
     if dither == "none":
-        return nearest_palette_quantize(image, palette_rgb, palette_lut, neutral_lut, neutral_threshold)
+        return nearest_palette_quantize(
+            image,
+            palette_rgb,
+            palette_lut,
+            neutral_lut,
+            neutral_threshold,
+            neutral_saturation,
+            shadow_neutral_max,
+            shadow_neutral_saturation,
+        )
     if dither == "pillow":
         return image.quantize(palette=build_palette_image(palette_rgb), dither=Image.Dither.FLOYDSTEINBERG)
     return error_diffusion_quantize(
@@ -490,7 +584,11 @@ def quantize_to_spectra(
         palette_lut,
         neutral_lut,
         neutral_threshold,
+        neutral_saturation,
+        shadow_neutral_max,
+        shadow_neutral_saturation,
         diffusion_strength,
+        chroma_diffusion_strength,
         serpentine,
     )
 
@@ -627,10 +725,34 @@ def parse_args() -> argparse.Namespace:
         help="Scale error diffusion. Lower values look cleaner; 1.0 is mathematically stronger but noisier.",
     )
     parser.add_argument(
+        "--chroma-diffusion-strength",
+        type=float,
+        default=DEFAULT_CHROMA_DIFFUSION_STRENGTH,
+        help="Scale color-only diffusion error. Lower values reduce colored speckles while preserving tone.",
+    )
+    parser.add_argument(
         "--neutral-threshold",
         type=int,
         default=DEFAULT_NEUTRAL_THRESHOLD,
         help="RGB max-min threshold for neutral pixels that should dither with black/white only. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--neutral-saturation",
+        type=float,
+        default=DEFAULT_NEUTRAL_SATURATION,
+        help="HSV-style saturation threshold for low-color pixels that should dither with black/white only.",
+    )
+    parser.add_argument(
+        "--shadow-neutral-max",
+        type=int,
+        default=DEFAULT_SHADOW_NEUTRAL_MAX,
+        help="Treat shadows at or below this RGB value as neutral when saturation is low. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--shadow-neutral-saturation",
+        type=float,
+        default=DEFAULT_SHADOW_NEUTRAL_SATURATION,
+        help="Saturation limit used with --shadow-neutral-max to suppress colored shadow speckles.",
     )
     parser.add_argument(
         "--no-serpentine",
@@ -678,7 +800,11 @@ def convert_one(
         palette_lut=palette_lut,
         neutral_lut=neutral_lut,
         neutral_threshold=args.neutral_threshold,
+        neutral_saturation=args.neutral_saturation,
+        shadow_neutral_max=args.shadow_neutral_max,
+        shadow_neutral_saturation=args.shadow_neutral_saturation,
         diffusion_strength=args.diffusion_strength,
+        chroma_diffusion_strength=args.chroma_diffusion_strength,
         serpentine=not args.no_serpentine,
     )
 

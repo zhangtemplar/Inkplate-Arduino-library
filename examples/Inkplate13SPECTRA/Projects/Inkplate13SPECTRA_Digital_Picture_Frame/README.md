@@ -70,7 +70,7 @@ python3 tools/convert_to_inkplate13spectra_bin.py ~/Pictures/frame --recursive
 python3 tools/convert_to_inkplate13spectra_bin.py "./photos/*.jpg" --output-dir /Volumes/SDCARD/frame/photos
 ```
 
-The converter defaults to `--orientation auto`, using a 1600x1200 landscape canvas for wide images and a 1200x1600 portrait canvas for tall images. It defaults to `--fit contain` so artwork and family photos are not cropped; use `--fit cover` when you prefer full-screen crop. The default photo-frame rendering applies Lanczos resize, `--contrast 1.10`, `--saturation 1.16`, `--sharpen 0.50`, restrained Stucki error diffusion, serpentine scan rows, and neutral protection. This favors cleaner wall-frame viewing over mathematically aggressive dithering. Runtime JPG/PNG/BMP rendering is a fallback path; it does not perform high-quality aspect-fit resizing and cannot match the converter's output.
+The converter defaults to the recommended photo-frame quality path: `--orientation auto`, using a 1600x1200 landscape canvas for wide images and a 1200x1600 portrait canvas for tall images. It defaults to `--fit contain` so artwork and family photos are not cropped; use `--fit cover` when you prefer full-screen crop. Default rendering applies Lanczos resize, `--contrast 1.10`, `--saturation 1.16`, `--sharpen 0.50`, restrained Stucki error diffusion, serpentine scan rows, strong chroma-damped diffusion, and neutral/shadow protection. This favors clean wall-frame viewing with fewer colored dither speckles. Runtime JPG/PNG/BMP rendering is a fallback path; it does not perform high-quality aspect-fit resizing and cannot match the converter's output.
 
 For best color matching, measure your exact panel and viewing light with `panel_profile.py`, then pass the generated JSON profile:
 
@@ -85,7 +85,13 @@ The profile replaces ideal RGB primaries with measured Spectra 6 ink colors duri
 Useful quality controls:
 
 ```sh
---diffusion-strength 0.60     # lower is cleaner; 1.0 is noisier but more exact
---neutral-threshold 18        # protect near-gray regions from colored speckles
+--diffusion-strength 0.40            # lower is cleaner; 1.0 is noisier but more exact
+--chroma-diffusion-strength 0.20     # lower reduces red/green/blue speckling
+--neutral-threshold 22               # protect near-gray regions from colored speckles
+--neutral-saturation 0.20            # protect low-saturation regions
+--shadow-neutral-max 88              # protect low-saturation dark regions
+--shadow-neutral-saturation 0.42
 --contrast 1.10 --saturation 1.16 --sharpen 0.50
 ```
+
+For slightly more color detail at the cost of more speckling, try `--diffusion-strength 0.50 --chroma-diffusion-strength 0.35 --neutral-saturation 0.16`.
