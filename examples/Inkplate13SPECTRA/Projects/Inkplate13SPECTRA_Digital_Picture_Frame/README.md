@@ -46,11 +46,13 @@ To force config mode later, press the Inkplate 13SPECTRA WAKE button while the f
 
 The config page shows the tail of `/frame/sync_debug.log`, and the same debug lines are printed to Serial at 115200 baud. Open `/log` for the full recent sync log and `/manifest_response` for the raw response captured from the last manifest request. Tokens are redacted from logged URLs. The "Sync photos now" button queues sync and returns immediately; while sync runs, `/log` remains available and SD-mutating commands are rejected until sync completes.
 
+The config screen also renders a compact Spectra 6 profiling chart in the unused right-side area. Photograph that chart with a ColorChecker under your normal viewing light, then use `panel_profile.py measure` to create a panel profile for the BIN converter.
+
 In normal frame mode, the sketch displays a local photo first, then runs scheduled sync with that photo left on the e-paper panel. If no local photos exist yet, it may sync before the first photo display.
 
 ## File Management
 
-The config page includes an SD file manager scoped to the configured photo folder. Use it to upload `.bin`, `.jpg`, `.jpeg`, `.png`, or `.bmp` images, create subfolders, delete individual image files, and recursively delete subfolders. Photo playback scans subfolders too. Deleting the photo root itself is blocked so settings and sync state stay intact.
+The config page includes an SD file manager scoped to the configured photo folder. Use it to upload `.bin`, `.jpg`, `.jpeg`, `.png`, or `.bmp` images, create subfolders, delete individual image files, recursively delete subfolders, or reset the local image cache. Cache reset deletes supported image files plus image `.tmp`/`.upload` leftovers under the photo folder and clears Drive sync metadata, but keeps folders, settings, logs, and the photo root. Photo playback scans subfolders too. Deleting the photo root itself is blocked so settings and sync state stay intact.
 
 ## BIN Conversion
 

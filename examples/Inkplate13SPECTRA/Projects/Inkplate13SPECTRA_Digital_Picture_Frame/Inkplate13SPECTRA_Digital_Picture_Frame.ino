@@ -53,6 +53,12 @@ static const size_t DECODED_WRITE_BUFFER_BYTES = 7680;
 static const uint32_t LARGE_APPS_SCRIPT_FILE_BYTES = 8UL * 1024UL * 1024UL;
 static const uint8_t PHOTO_ROTATION_PORTRAIT = 0;
 static const uint8_t PHOTO_ROTATION_LANDSCAPE = 1;
+static const uint16_t PROFILE_CHART_X = 1030;
+static const uint16_t PROFILE_CHART_Y = 70;
+static const uint16_t PROFILE_SWATCH_W = 166;
+static const uint16_t PROFILE_SWATCH_H = 130;
+static const uint16_t PROFILE_SWATCH_GAP = 12;
+static const uint16_t PROFILE_CORNER_LENGTH = 28;
 
 Inkplate display;
 WebServer server(80);
@@ -486,6 +492,18 @@ bool hasSupportedExtension(String name)
            name.endsWith(".bmp");
 }
 
+bool isImageCacheFile(String name)
+{
+    name.toLowerCase();
+    if (hasSupportedExtension(name))
+        return true;
+    if (name.endsWith(".tmp"))
+        return hasSupportedExtension(name.substring(0, name.length() - 4));
+    if (name.endsWith(".upload"))
+        return hasSupportedExtension(name.substring(0, name.length() - 7));
+    return false;
+}
+
 bool hasCommonImageExtension(String name)
 {
     name.toLowerCase();
@@ -677,7 +695,47 @@ void setUiRotation()
     display.setRotation(PHOTO_ROTATION_LANDSCAPE);
 }
 
-void showStatus(const String &title, const String &line1 = "", const String &line2 = "", const String &line3 = "")
+void drawProfileCorner(uint16_t x, uint16_t y, int8_t xDirection, int8_t yDirection)
+{
+    display.drawLine(x, y, x + xDirection * PROFILE_CORNER_LENGTH, y, INKPLATE_BLACK);
+    display.drawLine(x, y, x, y + yDirection * PROFILE_CORNER_LENGTH, INKPLATE_BLACK);
+}
+
+void drawConfigProfileChart()
+{
+    static const uint8_t chartColors[6] = {
+        INKPLATE_BLACK, INKPLATE_WHITE, INKPLATE_YELLOW,
+        INKPLATE_RED,   INKPLATE_GREEN, INKPLATE_BLUE};
+
+    const uint16_t chartWidth = PROFILE_SWATCH_W * 3 + PROFILE_SWATCH_GAP * 2;
+    const uint16_t chartHeight = PROFILE_SWATCH_H * 2 + PROFILE_SWATCH_GAP;
+    const uint16_t x0 = PROFILE_CHART_X;
+    const uint16_t y0 = PROFILE_CHART_Y;
+
+    for (uint8_t i = 0; i < 6; ++i)
+    {
+        const uint8_t col = i % 3;
+        const uint8_t row = i / 3;
+        const uint16_t x = x0 + col * (PROFILE_SWATCH_W + PROFILE_SWATCH_GAP);
+        const uint16_t y = y0 + row * (PROFILE_SWATCH_H + PROFILE_SWATCH_GAP);
+
+        display.fillRect(x, y, PROFILE_SWATCH_W, PROFILE_SWATCH_H, chartColors[i]);
+        display.drawRect(x, y, PROFILE_SWATCH_W, PROFILE_SWATCH_H, INKPLATE_BLACK);
+    }
+
+    const uint16_t cornerGap = 12;
+    const uint16_t left = x0 - cornerGap;
+    const uint16_t top = y0 - cornerGap;
+    const uint16_t right = x0 + chartWidth + cornerGap;
+    const uint16_t bottom = y0 + chartHeight + cornerGap;
+    drawProfileCorner(left, top, 1, 1);
+    drawProfileCorner(right, top, -1, 1);
+    drawProfileCorner(left, bottom, 1, -1);
+    drawProfileCorner(right, bottom, -1, -1);
+}
+
+void showStatus(const String &title, const String &line1 = "", const String &line2 = "", const String &line3 = "",
+                bool includeProfileChart = false)
 {
     setUiRotation();
     display.clearDisplay();
@@ -693,6 +751,8 @@ void showStatus(const String &title, const String &line1 = "", const String &lin
         display.println(line2);
     if (line3.length())
         display.println(line3);
+    if (includeProfileChart)
+        drawConfigProfileChart();
     display.display();
 }
 
@@ -814,7 +874,7 @@ void showConfigStatus()
         line2 = "Starting fallback AP...";
     }
 
-    showStatus("Config mode", line1, line2, line3);
+    showStatus("Config mode", line1, line2, line3, true);
 }
 
 void scanPhotosInDir(const String &dirPath, uint8_t depth)
@@ -940,6 +1000,80 @@ bool deleteManagedFolder(const String &path)
         return false;
 
     return deleteFolderRecursive(managed, 0);
+}
+
+bool deleteImageCacheInDir(const String &dirPath, uint8_t depth, uint32_t &deleted, uint32_t &failed)
+{
+    if (depth > 8)
+    {
+        failed++;
+        return false;
+    }
+
+    SdFat &sd = display.getSdFat();
+    SdFile dir;
+    if (!dir.open(dirPath.c_str(), O_RDONLY) || !dir.isDir())
+    {
+        dir.close();
+        failed++;
+        return false;
+    }
+
+    bool ok = true;
+    SdFile entry;
+    while (entry.openNext(&dir, O_RDONLY))
+    {
+        char name[96];
+        if (!entry.getName(name, sizeof(name)))
+        {
+            entry.close();
+            failed++;
+            ok = false;
+            continue;
+        }
+
+        String nameString = String(name);
+        String childPath = joinPath(dirPath.c_str(), nameString);
+        bool isDirectory = entry.isDir();
+        bool isImage = !isDirectory && isImageCacheFile(nameString);
+        entry.close();
+
+        if (isDirectory)
+        {
+            if (!deleteImageCacheInDir(childPath, depth + 1, deleted, failed))
+                ok = false;
+        }
+        else if (isImage)
+        {
+            if (sd.remove(childPath.c_str()))
+                deleted++;
+            else
+            {
+                failed++;
+                ok = false;
+            }
+            serviceWebServerDuringLongTask();
+        }
+    }
+
+    dir.close();
+    return ok;
+}
+
+bool resetLocalImageCache(uint32_t &deleted, uint32_t &failed)
+{
+    deleted = 0;
+    failed = 0;
+    ensureStorage();
+
+    bool ok = deleteImageCacheInDir(photoRoot(), 0, deleted, failed);
+    display.getSdFat().remove(SYNC_STATE_PATH);
+    photoCount = 0;
+    config.lastIndex = 0;
+    saveConfig();
+    updatesSinceLastSync = config.syncEveryUpdates;
+    syncCounterInitialized = true;
+    return ok && failed == 0;
 }
 
 void appendFileManagerRows(String &html, const String &dirPath, uint8_t depth, uint16_t &rows)
@@ -2338,6 +2472,9 @@ void handleIndex()
     html += "<form method='POST' action='/show'><button type='submit'>Show next local photo</button></form>";
     html += "<h2>Files</h2>";
     html += "<div class='row'>Photo root: " + htmlEscape(photoRoot()) + "</div>";
+    html += "<form method='POST' action='/reset_cache' "
+            "onsubmit=\"return confirm('Delete all local images under the photo folder? Settings and folders stay.')\">";
+    html += "<button type='submit'>Reset local image cache</button></form>";
     html += "<form id='uploadForm' method='POST' action='/upload?folder=" + urlEncode(photoRoot()) +
             "' enctype='multipart/form-data' onsubmit=\"this.action='/upload?folder='+encodeURIComponent(document.getElementById('uploadFolder').value)\">";
     html += "<label>Upload folder</label><input id='uploadFolder' name='folder' value='" + htmlEscape(photoRoot()) + "'>";
@@ -2509,6 +2646,28 @@ void handleDeleteFolder()
     redirectHome();
 }
 
+void handleResetCache()
+{
+    if (rejectIfSyncInProgress())
+        return;
+    if (configSyncPending)
+    {
+        lastWebMessage = "Sync is queued. Wait for it to finish before resetting the local cache.";
+        redirectHome();
+        return;
+    }
+
+    uint32_t deleted = 0;
+    uint32_t failed = 0;
+    resetLocalImageCache(deleted, failed);
+    lastWebMessage = "Reset local image cache: deleted " + String(deleted) + " cache files.";
+    if (failed > 0)
+        lastWebMessage += " Failed " + String(failed) + ".";
+    debugLog(lastWebMessage);
+    scanPhotos();
+    redirectHome();
+}
+
 void handleUploadComplete()
 {
     if (rejectIfSyncInProgress())
@@ -2629,6 +2788,7 @@ void runConfigMode()
     server.on("/mkdir", HTTP_POST, handleCreateFolder);
     server.on("/delete_file", HTTP_POST, handleDeleteFile);
     server.on("/delete_folder", HTTP_POST, handleDeleteFolder);
+    server.on("/reset_cache", HTTP_POST, handleResetCache);
     server.on("/reboot", HTTP_POST, handleReboot);
     server.begin();
 
