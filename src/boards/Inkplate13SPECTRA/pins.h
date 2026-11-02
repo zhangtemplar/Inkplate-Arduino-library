@@ -6,8 +6,10 @@
 #include "soc/gpio_struct.h"
 #define IO_INT_ADDR 0x20
 
-// Color display of the spectra panel
-static uint32_t pallete[] = {0x000000, 0xFFFFFF, 0xFFFF00, 0xFF0000, 0x0000FF, 0x00FF00};
+// Photo-frame matching colors used by ImageColor dithering.
+// Red is kept deliberately strong so warm tones do not over-select red ink.
+// Hardware output indexes stay defined below in colorPalette.
+static uint32_t pallete[] = {0x1F2226, 0xD6D6D6, 0xDBD529, 0xFF2020, 0x416CE1, 0x067406};
 
 // Pin on the internal io expander which controls MOSFET for turning on and off the SD card
 #define SD_PMOS_PIN IO_PIN_B2 // 10

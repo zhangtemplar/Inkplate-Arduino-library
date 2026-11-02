@@ -70,7 +70,7 @@ python3 tools/convert_to_inkplate13spectra_bin.py ~/Pictures/frame --recursive
 python3 tools/convert_to_inkplate13spectra_bin.py "./photos/*.jpg" --output-dir /Volumes/SDCARD/frame/photos
 ```
 
-The converter defaults to the recommended photo-frame quality path: `--orientation auto`, using a 1600x1200 landscape canvas for wide images and a 1200x1600 portrait canvas for tall images. It defaults to `--fit contain` so artwork and family photos are not cropped; use `--fit cover` when you prefer full-screen crop. Default rendering applies Lanczos resize, `--contrast 1.10`, `--saturation 1.16`, `--sharpen 0.50`, restrained Stucki error diffusion, serpentine scan rows, strong chroma-damped diffusion, and neutral/shadow protection. This favors clean wall-frame viewing with fewer colored dither speckles. Runtime JPG/PNG/BMP rendering is a fallback path; it does not perform high-quality aspect-fit resizing and cannot match the converter's output.
+The converter defaults to the recommended photo-frame quality path: `--orientation auto`, using a 1600x1200 landscape canvas for wide images and a 1200x1600 portrait canvas for tall images. It defaults to `--fit contain` so artwork and family photos are not cropped; use `--fit cover` when you prefer full-screen crop. Default rendering applies Lanczos resize, an `epdoptimize`-style photo-frame palette, `--color-matching lab`, gentle display-range compression, `--contrast 1.10`, `--saturation 1.0`, `--red-saturation-scale 0.85`, `--sharpen 0.50`, restrained Stucki error diffusion, serpentine scan rows, chroma-damped diffusion, neutral/shadow protection, scarce-ink bias for red/blue/black, and light edge cleanup. This favors clean wall-frame viewing with fewer colored dither speckles and less aggressive primary-color patches. Runtime JPG/PNG/BMP rendering is a fallback path; it now uses the same red-conservative palette matching, but it does not perform high-quality aspect-fit resizing or the converter's full tone pipeline.
 
 For best color matching, measure your exact panel and viewing light with `panel_profile.py`, then pass the generated JSON profile:
 
@@ -80,18 +80,24 @@ python3 panel_profile.py measure --panel panel.ARW --checker checker.ARW -o spec
 python3 tools/convert_to_inkplate13spectra_bin.py ~/Pictures/frame --recursive --panel-profile spectra6_profile.json
 ```
 
-The profile replaces ideal RGB primaries with measured Spectra 6 ink colors during quantization and preview generation. The packed `.bin` still uses the Inkplate hardware index order: black, white, yellow, red, blue, green.
+Without a measured profile, the converter uses `--palette-preset photo-frame`, which keeps calibrated Spectra 6 matching colors but reserves red ink for strongly red source pixels. Other built-in choices are `epdoptimize-boeber`, `epdoptimize-spectra6`, `epdoptimize-aitjcize`, `epdoptimize-legacy`, and `nominal`. The profile replaces built-in RGB primaries with measured Spectra 6 ink colors during quantization and preview generation. The packed `.bin` still uses the Inkplate hardware index order: black, white, yellow, red, blue, green.
 
 Useful quality controls:
 
 ```sh
---diffusion-strength 0.40            # lower is cleaner; 1.0 is noisier but more exact
---chroma-diffusion-strength 0.20     # lower reduces red/green/blue speckling
+--color-matching lab                 # rgb is punchier; chroma is for saturated art
+--dynamic-range display              # off, display, or auto percentile fitting
+--dynamic-range-strength 0.25        # higher preserves more range but can add color ink
+--edge-cleanup-strength 0.25         # reduce colored dither fuzz on strong edges
+--dither stucki                      # use coverage if large areas collapse to one ink
+--diffusion-strength 0.35            # lower is cleaner; 1.0 is noisier but more exact
+--chroma-diffusion-strength 0.10     # lower reduces red/green/blue speckling
 --neutral-threshold 22               # protect near-gray regions from colored speckles
---neutral-saturation 0.20            # protect low-saturation regions
+--neutral-saturation 0.26            # protect low-saturation regions
 --shadow-neutral-max 88              # protect low-saturation dark regions
 --shadow-neutral-saturation 0.42
---contrast 1.10 --saturation 1.16 --sharpen 0.50
+--palette-preset photo-frame
+--contrast 1.10 --saturation 1.0 --red-saturation-scale 0.85 --sharpen 0.50
 ```
 
-For slightly more color detail at the cost of more speckling, try `--diffusion-strength 0.50 --chroma-diffusion-strength 0.35 --neutral-saturation 0.16`.
+For slightly more color detail at the cost of more speckling, try `--color-matching rgb --diffusion-strength 0.50 --chroma-diffusion-strength 0.35 --neutral-saturation 0.16`. If large areas still collapse into red, black, or blue, try `--dither coverage`; it uses two-ink coverage mixing instead of nearest-color error diffusion, but it can look grainier. For stronger red output, raise `--red-saturation-scale` toward `1.0` or try `--palette-preset epdoptimize-boeber`. For illustration-style pastel preservation, try `--color-matching chroma`, but avoid it as the default for family photos because it can use much more color ink.

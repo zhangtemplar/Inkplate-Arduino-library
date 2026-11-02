@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
 import struct
 import sys
@@ -32,18 +33,35 @@ NATIVE_HEIGHT = 1600
 DATA_BYTES = NATIVE_WIDTH * NATIVE_HEIGHT // 2
 INPUT_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 PANEL_PALETTE_ORDER = ("black", "white", "yellow", "red", "blue", "green")
+DEFAULT_PALETTE_PRESET = "photo-frame"
 DEFAULT_FIT = "contain"
 DEFAULT_DITHER = "stucki"
 DEFAULT_BRIGHTNESS = 1.0
 DEFAULT_CONTRAST = 1.10
-DEFAULT_SATURATION = 1.16
+DEFAULT_SATURATION = 1.0
+DEFAULT_RED_SATURATION_SCALE = 0.85
 DEFAULT_SHARPEN = 0.50
-DEFAULT_DIFFUSION_STRENGTH = 0.40
-DEFAULT_CHROMA_DIFFUSION_STRENGTH = 0.20
+DEFAULT_COLOR_MATCHING = "lab"
+DEFAULT_TONE_CURVE = "off"
+DEFAULT_TONE_CURVE_STRENGTH = 0.0
+DEFAULT_SHADOW_BOOST = 0.0
+DEFAULT_HIGHLIGHT_COMPRESS = 0.0
+DEFAULT_TONE_MIDPOINT = 0.5
+DEFAULT_DYNAMIC_RANGE = "display"
+DEFAULT_DYNAMIC_RANGE_STRENGTH = 0.25
+DEFAULT_RANGE_LOW_PERCENTILE = 0.01
+DEFAULT_RANGE_HIGH_PERCENTILE = 0.99
+DEFAULT_WHITE_PRESERVE_PERCENTILE = 0.99
+DEFAULT_WHITE_PRESERVE_MIN_LUMA = 180
+DEFAULT_WHITE_PRESERVE_MAX_SATURATION = 0.18
+DEFAULT_DIFFUSION_STRENGTH = 0.35
+DEFAULT_CHROMA_DIFFUSION_STRENGTH = 0.10
 DEFAULT_NEUTRAL_THRESHOLD = 22
-DEFAULT_NEUTRAL_SATURATION = 0.20
+DEFAULT_NEUTRAL_SATURATION = 0.26
 DEFAULT_SHADOW_NEUTRAL_MAX = 88
 DEFAULT_SHADOW_NEUTRAL_SATURATION = 0.42
+DEFAULT_EDGE_CLEANUP_STRENGTH = 0.25
+DEFAULT_EDGE_CLEANUP_THRESHOLD = 42
 ROTATION_BY_ORIENTATION = {
     "portrait": 0,
     "landscape": 1,
@@ -56,6 +74,54 @@ NOMINAL_SPECTRA_PALETTE = {
     "red": (255, 0, 0),
     "blue": (0, 0, 255),
     "green": (0, 255, 0),
+}
+
+CALIBRATED_SPECTRA_PALETTE_PRESETS = {
+    "nominal": NOMINAL_SPECTRA_PALETTE,
+    # Palettes adapted from paperlesspaper/epdoptimize. These are calibrated display
+    # appearance colors used for matching; the packed BIN still stores native Inkplate indexes.
+    # photo-frame keeps calibrated non-red inks but treats red as a strong ink so warm
+    # skin, pink, and orange tones do not collapse into too much red.
+    "photo-frame": {
+        "black": (31, 34, 38),
+        "white": (214, 214, 214),
+        "yellow": (219, 213, 41),
+        "red": (255, 32, 32),
+        "blue": (65, 108, 225),
+        "green": (6, 116, 6),
+    },
+    "epdoptimize-spectra6": {
+        "black": (31, 34, 38),
+        "white": (185, 199, 201),
+        "yellow": (193, 187, 30),
+        "red": (98, 32, 30),
+        "blue": (35, 63, 142),
+        "green": (53, 86, 58),
+    },
+    "epdoptimize-aitjcize": {
+        "black": (2, 2, 2),
+        "white": (190, 200, 200),
+        "yellow": (205, 202, 0),
+        "red": (135, 19, 0),
+        "blue": (5, 64, 158),
+        "green": (39, 102, 60),
+    },
+    "epdoptimize-boeber": {
+        "black": (31, 34, 38),
+        "white": (214, 214, 214),
+        "yellow": (219, 213, 41),
+        "red": (234, 72, 67),
+        "blue": (65, 108, 225),
+        "green": (6, 116, 6),
+    },
+    "epdoptimize-legacy": {
+        "black": (25, 30, 33),
+        "white": (232, 232, 232),
+        "yellow": (239, 222, 68),
+        "red": (178, 19, 24),
+        "blue": (33, 87, 186),
+        "green": (18, 95, 32),
+    },
 }
 
 DIFFUSION_KERNELS = {
@@ -100,15 +166,22 @@ def palette_values(palette_rgb: list[tuple[int, int, int]]) -> list[int]:
     return palette
 
 
-def nominal_palette_rgb() -> list[tuple[int, int, int]]:
-    return [NOMINAL_SPECTRA_PALETTE[name] for name in PANEL_PALETTE_ORDER]
+def preset_palette_rgb(preset: str) -> list[tuple[int, int, int]]:
+    if preset not in CALIBRATED_SPECTRA_PALETTE_PRESETS:
+        choices = ", ".join(sorted(CALIBRATED_SPECTRA_PALETTE_PRESETS))
+        raise ValueError(f"Unknown palette preset {preset!r}. Choices: {choices}")
+    palette = CALIBRATED_SPECTRA_PALETTE_PRESETS[preset]
+    return [palette[name] for name in PANEL_PALETTE_ORDER]
 
 
-def load_panel_palette(profile_path: str | None) -> tuple[list[tuple[int, int, int]], list[tuple[float, float, float]]]:
+def load_panel_palette(
+    profile_path: str | None,
+    palette_preset: str,
+) -> tuple[list[tuple[int, int, int]], list[tuple[float, float, float]]]:
     """Load measured panel primaries from panel_profile.py's JSON output."""
 
     if not profile_path:
-        palette_rgb = nominal_palette_rgb()
+        palette_rgb = preset_palette_rgb(palette_preset)
         return palette_rgb, [rgb_to_lab(rgb) for rgb in palette_rgb]
 
     path = expand_path(profile_path)
@@ -285,11 +358,173 @@ def fit_image(
     return canvas
 
 
+def clamp_float(value: float, low: float, high: float) -> float:
+    if value < low:
+        return low
+    if value > high:
+        return high
+    return value
+
+
+def relative_luma_rgb(r: int | float, g: int | float, b: int | float) -> float:
+    return 0.299 * float(r) + 0.587 * float(g) + 0.114 * float(b)
+
+
+def histogram_percentile(histogram: list[int], percentile: float) -> int:
+    percentile = clamp_float(percentile, 0.0, 1.0)
+    total = sum(histogram)
+    if total <= 0:
+        return 0
+
+    target = max(1, int(math.ceil(total * percentile)))
+    seen = 0
+    for value, count in enumerate(histogram):
+        seen += count
+        if seen >= target:
+            return value
+    return 255
+
+
+def apply_scurve_tone(
+    image: Image.Image,
+    tone_curve: str,
+    strength: float,
+    shadow_boost: float,
+    highlight_compress: float,
+    midpoint: float,
+) -> Image.Image:
+    if tone_curve == "off" and shadow_boost == 0 and highlight_compress == 0:
+        return image
+
+    strength = clamp_float(strength, 0.0, 1.0)
+    midpoint = clamp_float(midpoint, 0.05, 0.95)
+    shadow_boost = clamp_float(shadow_boost, -1.0, 1.0)
+    highlight_compress = clamp_float(highlight_compress, -2.0, 2.0)
+    lut: list[int] = []
+
+    for value in range(256):
+        x = value / 255.0
+        y = x
+
+        if tone_curve == "scurve" and strength > 0:
+            if x < midpoint:
+                lower = x / midpoint
+                curved = midpoint * lower * lower * (3.0 - 2.0 * lower)
+            else:
+                upper = (x - midpoint) / (1.0 - midpoint)
+                curved = midpoint + (1.0 - midpoint) * upper * upper * (3.0 - 2.0 * upper)
+            y += (curved - x) * strength
+
+        if shadow_boost:
+            y += shadow_boost * (1.0 - x) * (1.0 - x) * x
+        if highlight_compress:
+            y -= highlight_compress * x * x * (1.0 - x)
+
+        lut.append(clamp_byte(y * 255.0))
+
+    return image.point(lut * 3)
+
+
+def apply_dynamic_range_compression(
+    image: Image.Image,
+    palette_rgb: list[tuple[int, int, int]],
+    mode: str,
+    strength: float,
+    low_percentile: float,
+    high_percentile: float,
+    preserve_white: bool,
+    white_preserve_percentile: float,
+    white_preserve_min_luma: int,
+    white_preserve_max_saturation: float,
+) -> Image.Image:
+    if mode == "off" or strength <= 0:
+        return image
+
+    strength = clamp_float(strength, 0.0, 1.0)
+    palette_lumas = [relative_luma_rgb(*rgb) for rgb in palette_rgb]
+    target_low = min(palette_lumas)
+    target_high = max(palette_lumas)
+    if target_high - target_low < 1:
+        return image
+
+    gray = image.convert("L")
+    histogram = gray.histogram()
+    if mode == "auto":
+        source_low = histogram_percentile(histogram, low_percentile)
+        source_high = histogram_percentile(histogram, high_percentile)
+    else:
+        source_low = 0
+        source_high = 255
+    if source_high <= source_low:
+        source_low, source_high = 0, 255
+
+    white_luma = relative_luma_rgb(*palette_rgb[1])
+    white_threshold = max(
+        white_preserve_min_luma,
+        histogram_percentile(histogram, white_preserve_percentile),
+    )
+
+    data = bytearray(image.tobytes())
+    for base in range(0, len(data), 3):
+        r = data[base]
+        g = data[base + 1]
+        b = data[base + 2]
+        luma = relative_luma_rgb(r, g, b)
+        normalized = clamp_float((luma - source_low) / (source_high - source_low), 0.0, 1.0)
+        fitted_luma = target_low + normalized * (target_high - target_low)
+        new_luma = luma + (fitted_luma - luma) * strength
+
+        if (
+            preserve_white
+            and luma >= white_threshold
+            and rgb_saturation(r, g, b) <= white_preserve_max_saturation
+            and new_luma < white_luma
+        ):
+            new_luma = white_luma
+
+        delta = new_luma - luma
+        data[base] = clamp_byte(r + delta)
+        data[base + 1] = clamp_byte(g + delta)
+        data[base + 2] = clamp_byte(b + delta)
+
+    return Image.frombytes("RGB", image.size, bytes(data))
+
+
+def reduce_red_saturation(image: Image.Image, scale: float) -> Image.Image:
+    """Slightly compress dominant red chroma to avoid red ink over-selection."""
+
+    if scale >= 0.999:
+        return image
+    scale = max(0.0, min(1.0, scale))
+
+    data = bytearray(image.tobytes())
+    for base in range(0, len(data), 3):
+        r = data[base]
+        g = data[base + 1]
+        b = data[base + 2]
+        other = max(g, b)
+        red_excess = r - other
+        if r < 72 or red_excess <= 16 or r < g + 10 or r < b + 14:
+            continue
+
+        strength = min(1.0, (red_excess - 16) / 96.0)
+        effective_scale = 1.0 - (1.0 - scale) * strength
+        data[base] = clamp_byte(other + 16 + (red_excess - 16) * effective_scale)
+
+    return Image.frombytes("RGB", image.size, bytes(data))
+
+
 def adjust_image(
     image: Image.Image,
     brightness: float,
     contrast: float,
     saturation: float,
+    red_saturation_scale: float,
+    tone_curve: str,
+    tone_curve_strength: float,
+    shadow_boost: float,
+    highlight_compress: float,
+    tone_midpoint: float,
     sharpen: float,
     autocontrast: bool,
     autocontrast_cutoff: float,
@@ -302,6 +537,8 @@ def adjust_image(
         image = ImageEnhance.Contrast(image).enhance(contrast)
     if saturation != 1.0:
         image = ImageEnhance.Color(image).enhance(saturation)
+    image = apply_scurve_tone(image, tone_curve, tone_curve_strength, shadow_boost, highlight_compress, tone_midpoint)
+    image = reduce_red_saturation(image, red_saturation_scale)
     if sharpen > 0:
         image = image.filter(ImageFilter.UnsharpMask(radius=1.0, percent=int(sharpen * 100), threshold=2))
     return image
@@ -335,12 +572,88 @@ def rgb_to_lab(rgb: tuple[int, int, int]) -> tuple[float, float, float]:
     return 116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)
 
 
-def build_nearest_palette_lut(
+def rgb_saturation(r: int, g: int, b: int) -> float:
+    value = max(r, g, b)
+    if value <= 0:
+        return 0.0
+    return (value - min(r, g, b)) / value
+
+
+def rgb_hue(r: int, g: int, b: int) -> float:
+    red = r / 255.0
+    green = g / 255.0
+    blue = b / 255.0
+    high = max(red, green, blue)
+    low = min(red, green, blue)
+    delta = high - low
+    if delta <= 0:
+        return 0.0
+
+    if high == red:
+        hue = 60.0 * (((green - blue) / delta) % 6.0)
+    elif high == green:
+        hue = 60.0 * ((blue - red) / delta + 2.0)
+    else:
+        hue = 60.0 * ((red - green) / delta + 4.0)
+    return hue + 360.0 if hue < 0 else hue
+
+
+def hue_distance(a: float, b: float) -> float:
+    delta = abs(a - b) % 360.0
+    return min(delta, 360.0 - delta)
+
+
+def palette_distance(
+    rgb: tuple[int, int, int],
+    index: int,
+    palette_rgb: list[tuple[int, int, int]],
     palette_lab: list[tuple[float, float, float]],
+    palette_saturations: list[float],
+    palette_hues: list[float],
+    color_matching: str,
+) -> float:
+    r, g, b = rgb
+    pal_r, pal_g, pal_b = palette_rgb[index]
+
+    if color_matching == "lab":
+        lab = rgb_to_lab(rgb)
+        pal_lab = palette_lab[index]
+        dl = lab[0] - pal_lab[0]
+        da = lab[1] - pal_lab[1]
+        db = lab[2] - pal_lab[2]
+        return dl * dl + da * da + db * db + scarce_ink_penalty(r, g, b, index, index, 1.0) * 0.12
+
+    dr = pal_r - r
+    dg = pal_g - g
+    db = pal_b - b
+    distance = dr * dr + dg * dg + db * db
+    if color_matching != "chroma":
+        return distance + scarce_ink_penalty(r, g, b, index, index, 1.0) * 0.35
+
+    source_saturation = rgb_saturation(r, g, b)
+    if source_saturation < 0.12:
+        return distance
+
+    penalty = 0.0
+    palette_saturation = palette_saturations[index]
+    if palette_saturation <= 0.12:
+        penalty += min(330.0, source_saturation * 1300.0)
+    else:
+        penalty += hue_distance(rgb_hue(r, g, b), palette_hues[index]) * 3.0
+
+    return math.sqrt(distance) + penalty + scarce_ink_penalty(r, g, b, index, index, 1.0) * 0.004
+
+
+def build_nearest_palette_lut(
+    palette_rgb: list[tuple[int, int, int]],
+    palette_lab: list[tuple[float, float, float]],
+    color_matching: str,
     allowed_indexes: tuple[int, ...] | None = None,
 ) -> bytearray:
     indexes = allowed_indexes or tuple(range(len(palette_lab)))
     lut = bytearray(32 * 32 * 32)
+    palette_saturations = [rgb_saturation(*rgb) for rgb in palette_rgb]
+    palette_hues = [rgb_hue(*rgb) for rgb in palette_rgb]
 
     for ri in range(32):
         r = 255 if ri == 31 else ri * 8 + 4
@@ -348,15 +661,19 @@ def build_nearest_palette_lut(
             g = 255 if gi == 31 else gi * 8 + 4
             for bi in range(32):
                 b = 255 if bi == 31 else bi * 8 + 4
-                lab = rgb_to_lab((r, g, b))
                 best_index = indexes[0]
                 best_distance = float("inf")
+                rgb = (r, g, b)
                 for index in indexes:
-                    pal_lab = palette_lab[index]
-                    dl = lab[0] - pal_lab[0]
-                    da = lab[1] - pal_lab[1]
-                    db = lab[2] - pal_lab[2]
-                    distance = dl * dl + da * da + db * db
+                    distance = palette_distance(
+                        rgb,
+                        index,
+                        palette_rgb,
+                        palette_lab,
+                        palette_saturations,
+                        palette_hues,
+                        color_matching,
+                    )
                     if distance < best_distance:
                         best_distance = distance
                         best_index = index
@@ -377,6 +694,104 @@ def palette_index_for_rgb(r: int, g: int, b: int, palette_lut: bytearray) -> int
     return palette_lut[((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)]
 
 
+def scarce_ink_penalty(
+    r: int,
+    g: int,
+    b: int,
+    idx_a: int,
+    idx_b: int,
+    t: float,
+) -> float:
+    red_coverage = (1.0 - t if idx_a == 3 else 0.0) + (t if idx_b == 3 else 0.0)
+    blue_coverage = (1.0 - t if idx_a == 4 else 0.0) + (t if idx_b == 4 else 0.0)
+    black_coverage = (1.0 - t if idx_a == 0 else 0.0) + (t if idx_b == 0 else 0.0)
+
+    red_allow = clamp_float((r - max(g, b) - 24) / 96.0, 0.0, 1.0)
+    blue_allow = clamp_float((b - max(r, g) - 24) / 96.0, 0.0, 1.0)
+    luma = relative_luma_rgb(r, g, b)
+    black_penalty = black_coverage * clamp_float((luma - 48.0) / 128.0, 0.0, 1.0) * 7000.0
+
+    return (
+        red_coverage * (1.0 - red_allow) * 18000.0
+        + blue_coverage * (1.0 - blue_allow) * 6000.0
+        + black_penalty
+    )
+
+
+def build_pair_mix_lut(
+    palette_rgb: list[tuple[int, int, int]],
+    allowed_indexes: tuple[int, ...] | None = None,
+) -> tuple[bytearray, bytearray, bytearray]:
+    indexes = allowed_indexes or tuple(range(len(palette_rgb)))
+    first = bytearray(32 * 32 * 32)
+    second = bytearray(32 * 32 * 32)
+    coverage = bytearray(32 * 32 * 32)
+    pairs = [(a, b) for pair_index, a in enumerate(indexes) for b in indexes[pair_index:]]
+
+    for ri in range(32):
+        r = 255 if ri == 31 else ri * 8 + 4
+        for gi in range(32):
+            g = 255 if gi == 31 else gi * 8 + 4
+            for bi in range(32):
+                b = 255 if bi == 31 else bi * 8 + 4
+                best_first = indexes[0]
+                best_second = indexes[0]
+                best_coverage = 0
+                best_distance = float("inf")
+
+                for idx_a, idx_b in pairs:
+                    ar, ag, ab = palette_rgb[idx_a]
+                    br, bg, bb = palette_rgb[idx_b]
+                    vr = br - ar
+                    vg = bg - ag
+                    vb = bb - ab
+                    denom = vr * vr + vg * vg + vb * vb
+                    if denom <= 0:
+                        t = 0.0
+                    else:
+                        t = ((r - ar) * vr + (g - ag) * vg + (b - ab) * vb) / denom
+                        t = clamp_float(t, 0.0, 1.0)
+
+                    mix_r = ar + vr * t
+                    mix_g = ag + vg * t
+                    mix_b = ab + vb * t
+                    dr = r - mix_r
+                    dg = g - mix_g
+                    db = b - mix_b
+                    distance = dr * dr + dg * dg + db * db + scarce_ink_penalty(r, g, b, idx_a, idx_b, t)
+
+                    if distance < best_distance:
+                        best_distance = distance
+                        best_first = idx_a
+                        best_second = idx_b
+                        best_coverage = clamp_byte(t * 255.0)
+
+                lut_index = (ri << 10) | (gi << 5) | bi
+                first[lut_index] = best_first
+                second[lut_index] = best_second
+                coverage[lut_index] = best_coverage
+
+    return first, second, coverage
+
+
+def pair_mix_for_rgb(
+    r: int,
+    g: int,
+    b: int,
+    mix_lut: tuple[bytearray, bytearray, bytearray],
+) -> tuple[int, int, int]:
+    lut_index = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)
+    return mix_lut[0][lut_index], mix_lut[1][lut_index], mix_lut[2][lut_index]
+
+
+def coverage_threshold(x: int, y: int) -> int:
+    value = (x * 374761393 + y * 668265263 + 0x9E3779B9) & 0xFFFFFFFF
+    value ^= value >> 13
+    value = (value * 1274126177) & 0xFFFFFFFF
+    value ^= value >> 16
+    return value & 0xFF
+
+
 def indexed_image_from_bytes(
     indices: bytes | bytearray,
     size: tuple[int, int],
@@ -385,13 +800,6 @@ def indexed_image_from_bytes(
     image = Image.frombytes("P", size, bytes(indices))
     image.putpalette(palette_values(palette_rgb))
     return image
-
-
-def rgb_saturation(r: int, g: int, b: int) -> float:
-    value = max(r, g, b)
-    if value <= 0:
-        return 0.0
-    return (value - min(r, g, b)) / value
 
 
 def is_neutral_rgb(
@@ -476,6 +884,43 @@ def nearest_palette_quantize(
     return indexed_image_from_bytes(out, image.size, palette_rgb)
 
 
+def coverage_quantize(
+    image: Image.Image,
+    palette_rgb: list[tuple[int, int, int]],
+    mix_lut: tuple[bytearray, bytearray, bytearray],
+    neutral_lut: bytearray,
+    neutral_threshold: int,
+    neutral_saturation: float,
+    shadow_neutral_max: int,
+    shadow_neutral_saturation: float,
+) -> Image.Image:
+    width, height = image.size
+    data = image.tobytes()
+    out = bytearray(width * height)
+
+    for y in range(height):
+        for x in range(width):
+            pixel = y * width + x
+            base = pixel * 3
+            r, g, b = data[base], data[base + 1], data[base + 2]
+            if is_neutral_rgb(
+                r,
+                g,
+                b,
+                neutral_threshold,
+                neutral_saturation,
+                shadow_neutral_max,
+                shadow_neutral_saturation,
+            ):
+                out[pixel] = palette_index_for_rgb(r, g, b, neutral_lut)
+                continue
+
+            first, second, coverage = pair_mix_for_rgb(r, g, b, mix_lut)
+            out[pixel] = second if coverage_threshold(x, y) < coverage else first
+
+    return indexed_image_from_bytes(out, image.size, palette_rgb)
+
+
 def error_diffusion_quantize(
     image: Image.Image,
     kernel_name: str,
@@ -556,6 +1001,7 @@ def quantize_to_spectra(
     palette_rgb: list[tuple[int, int, int]],
     palette_lut: bytearray,
     neutral_lut: bytearray,
+    mix_lut: tuple[bytearray, bytearray, bytearray],
     neutral_threshold: int,
     neutral_saturation: float,
     shadow_neutral_max: int,
@@ -569,6 +1015,17 @@ def quantize_to_spectra(
             image,
             palette_rgb,
             palette_lut,
+            neutral_lut,
+            neutral_threshold,
+            neutral_saturation,
+            shadow_neutral_max,
+            shadow_neutral_saturation,
+        )
+    if dither == "coverage":
+        return coverage_quantize(
+            image,
+            palette_rgb,
+            mix_lut,
             neutral_lut,
             neutral_threshold,
             neutral_saturation,
@@ -591,6 +1048,62 @@ def quantize_to_spectra(
         chroma_diffusion_strength,
         serpentine,
     )
+
+
+def cleanup_dithered_edges(
+    source: Image.Image,
+    quantized: Image.Image,
+    palette_rgb: list[tuple[int, int, int]],
+    palette_lut: bytearray,
+    neutral_lut: bytearray,
+    neutral_threshold: int,
+    neutral_saturation: float,
+    shadow_neutral_max: int,
+    shadow_neutral_saturation: float,
+    strength: float,
+    threshold: int,
+) -> Image.Image:
+    strength = clamp_float(strength, 0.0, 1.0)
+    if strength <= 0:
+        return quantized
+
+    width, height = source.size
+    if width < 3 or height < 3:
+        return quantized
+
+    effective_threshold = threshold + int((1.0 - strength) * 96)
+    gray = source.convert("L").tobytes()
+    source_data = source.tobytes()
+    out = bytearray(quantized.tobytes())
+
+    for y in range(1, height - 1):
+        row = y * width
+        for x in range(1, width - 1):
+            pixel = row + x
+            gradient = abs(gray[pixel + 1] - gray[pixel - 1]) + abs(gray[pixel + width] - gray[pixel - width])
+            if gradient < effective_threshold:
+                continue
+
+            base = pixel * 3
+            r = source_data[base]
+            g = source_data[base + 1]
+            b = source_data[base + 2]
+            lut = (
+                neutral_lut
+                if is_neutral_rgb(
+                    r,
+                    g,
+                    b,
+                    neutral_threshold,
+                    neutral_saturation,
+                    shadow_neutral_max,
+                    shadow_neutral_saturation,
+                )
+                else palette_lut
+            )
+            out[pixel] = palette_index_for_rgb(r, g, b, lut)
+
+    return indexed_image_from_bytes(out, quantized.size, palette_rgb)
 
 
 def pack_native_frame(logical: Image.Image, orientation: str) -> bytes:
@@ -688,10 +1201,22 @@ def parse_args() -> argparse.Namespace:
         help="Measured JSON profile from panel_profile.py. Uses real Spectra 6 primary colors for quantization.",
     )
     parser.add_argument(
+        "--palette-preset",
+        choices=tuple(sorted(CALIBRATED_SPECTRA_PALETTE_PRESETS)),
+        default=DEFAULT_PALETTE_PRESET,
+        help="Built-in calibrated palette used when --panel-profile is not supplied.",
+    )
+    parser.add_argument(
+        "--color-matching",
+        choices=("rgb", "lab", "chroma"),
+        default=DEFAULT_COLOR_MATCHING,
+        help="Palette distance model. lab is the conservative photo default; rgb is punchier; chroma protects saturated pastels.",
+    )
+    parser.add_argument(
         "--dither",
-        choices=("stucki", "floyd-steinberg", "atkinson", "pillow", "none"),
+        choices=("coverage", "stucki", "floyd-steinberg", "atkinson", "pillow", "none"),
         default=DEFAULT_DITHER,
-        help="Palette dithering method. stucki is the default quality-oriented renderer.",
+        help="Palette dithering method. stucki is the default; coverage uses two-ink mixing for flat-color collapse.",
     )
     parser.add_argument("--no-dither", action="store_true", help="Alias for --dither none.")
     parser.add_argument(
@@ -711,6 +1236,89 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_SATURATION,
         help="Saturation multiplier before quantization.",
+    )
+    parser.add_argument(
+        "--red-saturation-scale",
+        type=float,
+        default=DEFAULT_RED_SATURATION_SCALE,
+        help="Scale strongly red-dominant chroma before quantization. Use 1.0 to disable.",
+    )
+    parser.add_argument(
+        "--tone-curve",
+        choices=("off", "scurve"),
+        default=DEFAULT_TONE_CURVE,
+        help="Optional S-curve tone mapping before range compression.",
+    )
+    parser.add_argument(
+        "--tone-curve-strength",
+        type=float,
+        default=DEFAULT_TONE_CURVE_STRENGTH,
+        help="S-curve blend strength from 0 to 1.",
+    )
+    parser.add_argument(
+        "--shadow-boost",
+        type=float,
+        default=DEFAULT_SHADOW_BOOST,
+        help="Lift or lower shadows before quantization. Positive values lift shadows.",
+    )
+    parser.add_argument(
+        "--highlight-compress",
+        type=float,
+        default=DEFAULT_HIGHLIGHT_COMPRESS,
+        help="Compress or expand highlights before quantization. Positive values preserve highlight detail.",
+    )
+    parser.add_argument(
+        "--tone-midpoint",
+        type=float,
+        default=DEFAULT_TONE_MIDPOINT,
+        help="Midpoint used by --tone-curve scurve.",
+    )
+    parser.add_argument(
+        "--dynamic-range",
+        choices=("off", "display", "auto"),
+        default=DEFAULT_DYNAMIC_RANGE,
+        help="Compress source lightness into the usable display range. auto uses percentile clipping.",
+    )
+    parser.add_argument(
+        "--dynamic-range-strength",
+        type=float,
+        default=DEFAULT_DYNAMIC_RANGE_STRENGTH,
+        help="Blend strength for dynamic range compression from 0 to 1.",
+    )
+    parser.add_argument(
+        "--range-low-percentile",
+        type=float,
+        default=DEFAULT_RANGE_LOW_PERCENTILE,
+        help="Low percentile used by --dynamic-range auto.",
+    )
+    parser.add_argument(
+        "--range-high-percentile",
+        type=float,
+        default=DEFAULT_RANGE_HIGH_PERCENTILE,
+        help="High percentile used by --dynamic-range auto.",
+    )
+    parser.add_argument(
+        "--no-preserve-white",
+        action="store_true",
+        help="Disable white background preservation during dynamic range compression.",
+    )
+    parser.add_argument(
+        "--white-preserve-percentile",
+        type=float,
+        default=DEFAULT_WHITE_PRESERVE_PERCENTILE,
+        help="Bright percentile treated as background white when preserving whites.",
+    )
+    parser.add_argument(
+        "--white-preserve-min-luma",
+        type=int,
+        default=DEFAULT_WHITE_PRESERVE_MIN_LUMA,
+        help="Minimum source luma eligible for white preservation.",
+    )
+    parser.add_argument(
+        "--white-preserve-max-saturation",
+        type=float,
+        default=DEFAULT_WHITE_PRESERVE_MAX_SATURATION,
+        help="Maximum source saturation eligible for white preservation.",
     )
     parser.add_argument(
         "--sharpen",
@@ -755,6 +1363,18 @@ def parse_args() -> argparse.Namespace:
         help="Saturation limit used with --shadow-neutral-max to suppress colored shadow speckles.",
     )
     parser.add_argument(
+        "--edge-cleanup-strength",
+        type=float,
+        default=DEFAULT_EDGE_CLEANUP_STRENGTH,
+        help="Snap strong edges back to direct palette matches after dithering. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--edge-cleanup-threshold",
+        type=int,
+        default=DEFAULT_EDGE_CLEANUP_THRESHOLD,
+        help="Base luminance-gradient threshold for --edge-cleanup-strength.",
+    )
+    parser.add_argument(
         "--no-serpentine",
         action="store_true",
         help="Disable alternating left/right diffusion rows.",
@@ -778,6 +1398,7 @@ def convert_one(
     palette_rgb: list[tuple[int, int, int]],
     palette_lut: bytearray,
     neutral_lut: bytearray,
+    mix_lut: tuple[bytearray, bytearray, bytearray],
 ) -> None:
     background = ImageColor.getrgb(args.background)
     image = open_rgb(input_path, background)
@@ -789,16 +1410,35 @@ def convert_one(
         brightness=args.brightness,
         contrast=args.contrast,
         saturation=args.saturation,
+        red_saturation_scale=args.red_saturation_scale,
+        tone_curve=args.tone_curve,
+        tone_curve_strength=args.tone_curve_strength,
+        shadow_boost=args.shadow_boost,
+        highlight_compress=args.highlight_compress,
+        tone_midpoint=args.tone_midpoint,
         sharpen=args.sharpen,
         autocontrast=args.autocontrast,
         autocontrast_cutoff=args.autocontrast_cutoff,
     )
-    quantized = quantize_to_spectra(
+    processed = apply_dynamic_range_compression(
         adjusted,
+        palette_rgb=palette_rgb,
+        mode=args.dynamic_range,
+        strength=args.dynamic_range_strength,
+        low_percentile=args.range_low_percentile,
+        high_percentile=args.range_high_percentile,
+        preserve_white=not args.no_preserve_white,
+        white_preserve_percentile=args.white_preserve_percentile,
+        white_preserve_min_luma=args.white_preserve_min_luma,
+        white_preserve_max_saturation=args.white_preserve_max_saturation,
+    )
+    quantized = quantize_to_spectra(
+        processed,
         dither=args.dither,
         palette_rgb=palette_rgb,
         palette_lut=palette_lut,
         neutral_lut=neutral_lut,
+        mix_lut=mix_lut,
         neutral_threshold=args.neutral_threshold,
         neutral_saturation=args.neutral_saturation,
         shadow_neutral_max=args.shadow_neutral_max,
@@ -806,6 +1446,19 @@ def convert_one(
         diffusion_strength=args.diffusion_strength,
         chroma_diffusion_strength=args.chroma_diffusion_strength,
         serpentine=not args.no_serpentine,
+    )
+    quantized = cleanup_dithered_edges(
+        processed,
+        quantized,
+        palette_rgb=palette_rgb,
+        palette_lut=palette_lut,
+        neutral_lut=neutral_lut,
+        neutral_threshold=args.neutral_threshold,
+        neutral_saturation=args.neutral_saturation,
+        shadow_neutral_max=args.shadow_neutral_max,
+        shadow_neutral_saturation=args.shadow_neutral_saturation,
+        strength=args.edge_cleanup_strength,
+        threshold=args.edge_cleanup_threshold,
     )
 
     if preview_path:
@@ -828,9 +1481,10 @@ def main() -> int:
     if not input_files:
         raise SystemExit("No supported input images found.")
 
-    palette_rgb, palette_lab = load_panel_palette(args.panel_profile)
-    palette_lut = build_nearest_palette_lut(palette_lab)
-    neutral_lut = build_nearest_palette_lut(palette_lab, allowed_indexes=(0, 1))
+    palette_rgb, palette_lab = load_panel_palette(args.panel_profile, args.palette_preset)
+    palette_lut = build_nearest_palette_lut(palette_rgb, palette_lab, args.color_matching)
+    neutral_lut = build_nearest_palette_lut(palette_rgb, palette_lab, args.color_matching, allowed_indexes=(0, 1))
+    mix_lut = build_pair_mix_lut(palette_rgb)
 
     batch_mode = input_specs_are_batch(args.inputs, args.output, args.output_dir)
     should_skip_existing = False if args.force else args.skip_existing or batch_mode
@@ -848,7 +1502,16 @@ def main() -> int:
             continue
 
         try:
-            convert_one(input_path, output_path, preview_path, args, palette_rgb, palette_lut, neutral_lut)
+            convert_one(
+                input_path,
+                output_path,
+                preview_path,
+                args,
+                palette_rgb,
+                palette_lut,
+                neutral_lut,
+                mix_lut,
+            )
             converted += 1
         except Exception as exc:
             failed += 1
