@@ -3,8 +3,8 @@
 
 The output format starts with a 32 byte little-endian header followed by the
 native Inkplate 13SPECTRA framebuffer: 1200 x 1600 pixels, two 4-bit Spectra 6
-color indexes per byte, high nibble first. Source images can be packed as either
-1600 x 1200 landscape or 1200 x 1600 portrait logical views.
+framebuffer codes per byte, high nibble first. Source images can be packed as
+either 1600 x 1200 landscape or 1200 x 1600 portrait logical views.
 """
 
 from __future__ import annotations
@@ -33,6 +33,9 @@ NATIVE_HEIGHT = 1600
 DATA_BYTES = NATIVE_WIDTH * NATIVE_HEIGHT // 2
 INPUT_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 PANEL_PALETTE_ORDER = ("black", "white", "yellow", "red", "blue", "green")
+# The Arduino API exposes logical color indexes in PANEL_PALETTE_ORDER, but the
+# 13SPECTRA raw framebuffer uses native nibble codes for blue/green.
+RAW_FRAMEBUFFER_COLOR_INDEXES = (0, 1, 2, 3, 5, 6)
 DEFAULT_PALETTE_PRESET = "photo-frame"
 DEFAULT_FIT = "contain"
 DEFAULT_DITHER = "stucki"
@@ -1107,7 +1110,7 @@ def cleanup_dithered_edges(
 
 
 def pack_native_frame(logical: Image.Image, orientation: str) -> bytes:
-    """Map the logical view to the framebuffer used by the matching sketch rotation."""
+    """Map the logical palette view to the raw framebuffer used by the sketch."""
 
     pixels = logical.tobytes()
     logical_width, logical_height = logical.size
@@ -1116,7 +1119,10 @@ def pack_native_frame(logical: Image.Image, orientation: str) -> bytes:
 
     for y in range(logical_height):
         for x in range(logical_width):
-            color = pixels[y * logical_width + x] & 0x0F
+            logical_color = pixels[y * logical_width + x] & 0x0F
+            if logical_color >= len(RAW_FRAMEBUFFER_COLOR_INDEXES):
+                raise ValueError(f"Unsupported logical color index {logical_color}")
+            color = RAW_FRAMEBUFFER_COLOR_INDEXES[logical_color]
 
             if rotation == 1:
                 # Landscape uses sketch rotation 1:

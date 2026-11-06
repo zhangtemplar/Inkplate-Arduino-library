@@ -80,7 +80,7 @@ python3 panel_profile.py measure --panel panel.ARW --checker checker.ARW -o spec
 python3 tools/convert_to_inkplate13spectra_bin.py ~/Pictures/frame --recursive --panel-profile spectra6_profile.json
 ```
 
-Without a measured profile, the converter uses `--palette-preset photo-frame`, which keeps calibrated Spectra 6 matching colors but reserves red ink for strongly red source pixels. Other built-in choices are `epdoptimize-boeber`, `epdoptimize-spectra6`, `epdoptimize-aitjcize`, `epdoptimize-legacy`, and `nominal`. The profile replaces built-in RGB primaries with measured Spectra 6 ink colors during quantization and preview generation. The packed `.bin` still uses the Inkplate hardware index order: black, white, yellow, red, blue, green.
+Without a measured profile, the converter uses `--palette-preset photo-frame`, which keeps calibrated Spectra 6 matching colors but reserves red ink for strongly red source pixels. Other built-in choices are `epdoptimize-boeber`, `epdoptimize-spectra6`, `epdoptimize-aitjcize`, `epdoptimize-legacy`, and `nominal`. The profile replaces built-in RGB primaries with measured Spectra 6 ink colors during quantization and preview generation. The converter's logical palette order is black, white, yellow, red, blue, green, but the packed `.bin` payload stores raw 13SPECTRA framebuffer codes: black=0, white=1, yellow=2, red=3, blue=5, green=6. Regenerate older `.bin` files after this fix so blue and green are packed with the correct native codes.
 
 Useful quality controls:
 
