@@ -70,7 +70,7 @@ python3 tools/convert_to_inkplate13spectra_bin.py ~/Pictures/frame --recursive
 python3 tools/convert_to_inkplate13spectra_bin.py "./photos/*.jpg" --output-dir /Volumes/SDCARD/frame/photos
 ```
 
-The converter defaults to the recommended photo-frame quality path: `--orientation auto`, using a 1600x1200 landscape canvas for wide images and a 1200x1600 portrait canvas for tall images. It defaults to `--fit contain` so artwork and family photos are not cropped; use `--fit cover` when you prefer full-screen crop. Default rendering applies Lanczos resize, an `epdoptimize`-style photo-frame palette, `--color-matching lab`, gentle display-range compression, `--contrast 1.10`, `--saturation 1.0`, `--red-saturation-scale 0.85`, `--sharpen 0.50`, restrained Stucki error diffusion, serpentine scan rows, chroma-damped diffusion, neutral/shadow protection, scarce-ink bias for red/blue/black, and light edge cleanup. This favors clean wall-frame viewing with fewer colored dither speckles and less aggressive primary-color patches. Runtime JPG/PNG/BMP rendering is a fallback path; it now uses the same red-conservative palette matching, but it does not perform high-quality aspect-fit resizing or the converter's full tone pipeline.
+The converter defaults to the recommended photo-frame quality path: `--orientation auto`, using a 1600x1200 landscape canvas for wide images and a 1200x1600 portrait canvas for tall images. It defaults to `--fit contain` so artwork and family photos are not cropped; use `--fit cover` when you prefer full-screen crop. Default rendering applies Lanczos resize, an `epdoptimize`-style photo-frame palette, `--color-matching lab`, display-range mapping with `--display-gamma 1.15`, `--contrast 1.0`, `--saturation 1.0`, `--red-saturation-scale 0.85`, `--sharpen 0.50`, Stucki error diffusion, stricter neutral/shadow protection, scarce-ink bias for red/yellow/blue/green/black, and light edge cleanup. This preserves gray and skin midtones better while still giving photos multi-color residual diffusion. Runtime JPG/PNG/BMP rendering is a fallback path; it now uses the same red-conservative palette matching, but it does not perform high-quality aspect-fit resizing or the converter's full tone pipeline.
 
 For best color matching, measure your exact panel and viewing light with `panel_profile.py`, then pass the generated JSON profile:
 
@@ -80,24 +80,26 @@ python3 panel_profile.py measure --panel panel.ARW --checker checker.ARW -o spec
 python3 tools/convert_to_inkplate13spectra_bin.py ~/Pictures/frame --recursive --panel-profile spectra6_profile.json
 ```
 
-Without a measured profile, the converter uses `--palette-preset photo-frame`, which keeps calibrated Spectra 6 matching colors but reserves red ink for strongly red source pixels. Other built-in choices are `epdoptimize-boeber`, `epdoptimize-spectra6`, `epdoptimize-aitjcize`, `epdoptimize-legacy`, and `nominal`. The profile replaces built-in RGB primaries with measured Spectra 6 ink colors during quantization and preview generation. The converter's logical palette order is black, white, yellow, red, blue, green, but the packed `.bin` payload stores raw 13SPECTRA framebuffer codes: black=0, white=1, yellow=2, red=3, blue=5, green=6. Regenerate older `.bin` files after this fix so blue and green are packed with the correct native codes.
+Without a measured profile, the converter uses `--palette-preset photo-frame`, which keeps calibrated Spectra 6 matching colors but reserves red ink for strongly red source pixels. Other built-in choices are `epdoptimize-boeber`, `epdoptimize-spectra6`, `epdoptimize-aitjcize`, `epdoptimize-legacy`, and `nominal`. The profile replaces built-in RGB primaries with measured Spectra 6 ink colors during quantization and preview generation. Profiles may use `panel_profile.py` fields such as `srgb8`/`Lab_D65` or epdoptimize-style `color` fields like `"#B9C7C9"`; entries are matched by `name`, not file order. The converter's logical palette order is black, white, yellow, red, blue, green, but the packed `.bin` payload stores raw 13SPECTRA framebuffer codes: black=0, white=1, yellow=2, red=3, blue=5, green=6. Regenerate older `.bin` files after this fix so blue and green are packed with the correct native codes.
 
 Useful quality controls:
 
 ```sh
 --color-matching lab                 # rgb is punchier; chroma is for saturated art
 --dynamic-range display              # off, display, or auto percentile fitting
---dynamic-range-strength 0.25        # higher preserves more range but can add color ink
+--dynamic-range-strength 1.0         # map source luma into the panel gamut
+--display-gamma 1.15                 # values above 1 darken midtones before quantization
 --edge-cleanup-strength 0.25         # reduce colored dither fuzz on strong edges
---dither stucki                      # use coverage if large areas collapse to one ink
---diffusion-strength 0.35            # lower is cleaner; 1.0 is noisier but more exact
+--dither stucki                      # coverage can reduce collapse but may create white dots
+--diffusion-strength 0.85            # luma error diffusion; lower is cleaner but less tone-accurate
 --chroma-diffusion-strength 0.10     # lower reduces red/green/blue speckling
---neutral-threshold 22               # protect near-gray regions from colored speckles
---neutral-saturation 0.26            # protect low-saturation regions
+--neutral-diffusion-strength 1.0     # keep gray tones from collapsing to solid white
+--neutral-threshold 16               # protect near-gray regions from colored speckles
+--neutral-saturation 0.16            # protect low-saturation regions without catching most skin
 --shadow-neutral-max 88              # protect low-saturation dark regions
 --shadow-neutral-saturation 0.42
 --palette-preset photo-frame
---contrast 1.10 --saturation 1.0 --red-saturation-scale 0.85 --sharpen 0.50
+--contrast 1.0 --saturation 1.0 --red-saturation-scale 0.85 --sharpen 0.50
 ```
 
-For slightly more color detail at the cost of more speckling, try `--color-matching rgb --diffusion-strength 0.50 --chroma-diffusion-strength 0.35 --neutral-saturation 0.16`. If large areas still collapse into red, black, or blue, try `--dither coverage`; it uses two-ink coverage mixing instead of nearest-color error diffusion, but it can look grainier. For stronger red output, raise `--red-saturation-scale` toward `1.0` or try `--palette-preset epdoptimize-boeber`. For illustration-style pastel preservation, try `--color-matching chroma`, but avoid it as the default for family photos because it can use much more color ink.
+For slightly more color detail at the cost of more speckling, try `--color-matching rgb --chroma-diffusion-strength 0.25`. If faces still look too pale with a measured profile, raise `--display-gamma` toward `1.30` or lower `--brightness` slightly. For stronger red output, raise `--red-saturation-scale` toward `1.0` or try `--palette-preset epdoptimize-boeber`. For illustration-style pastel preservation, try `--color-matching chroma`, but avoid it as the default for family photos because it can use much more color ink. Use `--dither coverage` only when a flat-color image collapses into a single ink and white-dot texture is acceptable.

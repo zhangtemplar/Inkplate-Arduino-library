@@ -40,7 +40,7 @@ DEFAULT_PALETTE_PRESET = "photo-frame"
 DEFAULT_FIT = "contain"
 DEFAULT_DITHER = "stucki"
 DEFAULT_BRIGHTNESS = 1.0
-DEFAULT_CONTRAST = 1.10
+DEFAULT_CONTRAST = 1.0
 DEFAULT_SATURATION = 1.0
 DEFAULT_RED_SATURATION_SCALE = 0.85
 DEFAULT_SHARPEN = 0.50
@@ -51,16 +51,18 @@ DEFAULT_SHADOW_BOOST = 0.0
 DEFAULT_HIGHLIGHT_COMPRESS = 0.0
 DEFAULT_TONE_MIDPOINT = 0.5
 DEFAULT_DYNAMIC_RANGE = "display"
-DEFAULT_DYNAMIC_RANGE_STRENGTH = 0.25
+DEFAULT_DYNAMIC_RANGE_STRENGTH = 1.0
+DEFAULT_DISPLAY_GAMMA = 1.15
 DEFAULT_RANGE_LOW_PERCENTILE = 0.01
 DEFAULT_RANGE_HIGH_PERCENTILE = 0.99
 DEFAULT_WHITE_PRESERVE_PERCENTILE = 0.99
-DEFAULT_WHITE_PRESERVE_MIN_LUMA = 180
-DEFAULT_WHITE_PRESERVE_MAX_SATURATION = 0.18
-DEFAULT_DIFFUSION_STRENGTH = 0.35
+DEFAULT_WHITE_PRESERVE_MIN_LUMA = 224
+DEFAULT_WHITE_PRESERVE_MAX_SATURATION = 0.08
+DEFAULT_DIFFUSION_STRENGTH = 0.85
 DEFAULT_CHROMA_DIFFUSION_STRENGTH = 0.10
-DEFAULT_NEUTRAL_THRESHOLD = 22
-DEFAULT_NEUTRAL_SATURATION = 0.26
+DEFAULT_NEUTRAL_DIFFUSION_STRENGTH = 1.0
+DEFAULT_NEUTRAL_THRESHOLD = 16
+DEFAULT_NEUTRAL_SATURATION = 0.16
 DEFAULT_SHADOW_NEUTRAL_MAX = 88
 DEFAULT_SHADOW_NEUTRAL_SATURATION = 0.42
 DEFAULT_EDGE_CLEANUP_STRENGTH = 0.25
@@ -169,6 +171,24 @@ def palette_values(palette_rgb: list[tuple[int, int, int]]) -> list[int]:
     return palette
 
 
+def parse_rgb8(value: object, field_name: str) -> tuple[int, int, int]:
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("#"):
+            text = text[1:]
+        if len(text) == 6:
+            try:
+                return tuple(int(text[index : index + 2], 16) for index in (0, 2, 4))
+            except ValueError as exc:
+                raise ValueError(f"Invalid hex color in {field_name}: {value!r}") from exc
+        raise ValueError(f"Invalid hex color in {field_name}: {value!r}")
+
+    if isinstance(value, (list, tuple)) and len(value) == 3:
+        return tuple(max(0, min(255, int(round(float(channel))))) for channel in value)
+
+    raise ValueError(f"{field_name} must be #RRGGBB or a 3-item RGB list")
+
+
 def preset_palette_rgb(preset: str) -> list[tuple[int, int, int]]:
     if preset not in CALIBRATED_SPECTRA_PALETTE_PRESETS:
         choices = ", ".join(sorted(CALIBRATED_SPECTRA_PALETTE_PRESETS))
@@ -195,7 +215,8 @@ def load_panel_palette(
         )
 
     profile = json.loads(path.read_text())
-    primaries = {str(primary["name"]).lower(): primary for primary in profile.get("primaries", [])}
+    primary_list = profile if isinstance(profile, list) else profile.get("primaries", [])
+    primaries = {str(primary["name"]).lower(): primary for primary in primary_list}
 
     missing = [name for name in PANEL_PALETTE_ORDER if name not in primaries]
     if missing:
@@ -205,12 +226,16 @@ def load_panel_palette(
     palette_lab: list[tuple[float, float, float]] = []
     for name in PANEL_PALETTE_ORDER:
         primary = primaries[name]
-        rgb = primary.get("srgb8") or primary.get("nominal_srgb8") or NOMINAL_SPECTRA_PALETTE[name]
+        rgb = (
+            primary.get("srgb8")
+            or primary.get("color")
+            or primary.get("rgb8")
+            or primary.get("nominal_srgb8")
+            or NOMINAL_SPECTRA_PALETTE[name]
+        )
         lab = primary.get("Lab_D65")
 
-        if len(rgb) != 3:
-            raise ValueError(f"Panel profile primary {name} has invalid srgb8")
-        palette_rgb.append(tuple(max(0, min(255, int(round(channel)))) for channel in rgb))
+        palette_rgb.append(parse_rgb8(rgb, f"primary {name} color"))
 
         if lab is not None:
             if len(lab) != 3:
@@ -433,6 +458,7 @@ def apply_dynamic_range_compression(
     palette_rgb: list[tuple[int, int, int]],
     mode: str,
     strength: float,
+    display_gamma: float,
     low_percentile: float,
     high_percentile: float,
     preserve_white: bool,
@@ -460,6 +486,7 @@ def apply_dynamic_range_compression(
         source_high = 255
     if source_high <= source_low:
         source_low, source_high = 0, 255
+    display_gamma = max(0.10, display_gamma)
 
     white_luma = relative_luma_rgb(*palette_rgb[1])
     white_threshold = max(
@@ -474,6 +501,8 @@ def apply_dynamic_range_compression(
         b = data[base + 2]
         luma = relative_luma_rgb(r, g, b)
         normalized = clamp_float((luma - source_low) / (source_high - source_low), 0.0, 1.0)
+        if display_gamma != 1.0:
+            normalized = pow(normalized, display_gamma)
         fitted_luma = target_low + normalized * (target_high - target_low)
         new_luma = luma + (fitted_luma - luma) * strength
 
@@ -706,17 +735,23 @@ def scarce_ink_penalty(
     t: float,
 ) -> float:
     red_coverage = (1.0 - t if idx_a == 3 else 0.0) + (t if idx_b == 3 else 0.0)
+    yellow_coverage = (1.0 - t if idx_a == 2 else 0.0) + (t if idx_b == 2 else 0.0)
     blue_coverage = (1.0 - t if idx_a == 4 else 0.0) + (t if idx_b == 4 else 0.0)
+    green_coverage = (1.0 - t if idx_a == 5 else 0.0) + (t if idx_b == 5 else 0.0)
     black_coverage = (1.0 - t if idx_a == 0 else 0.0) + (t if idx_b == 0 else 0.0)
 
     red_allow = clamp_float((r - max(g, b) - 24) / 96.0, 0.0, 1.0)
+    yellow_allow = clamp_float((min(r, g) - b - 12) / 96.0, 0.0, 1.0)
     blue_allow = clamp_float((b - max(r, g) - 24) / 96.0, 0.0, 1.0)
+    green_allow = clamp_float((g - max(r, b) - 18) / 96.0, 0.0, 1.0)
     luma = relative_luma_rgb(r, g, b)
     black_penalty = black_coverage * clamp_float((luma - 48.0) / 128.0, 0.0, 1.0) * 7000.0
 
     return (
-        red_coverage * (1.0 - red_allow) * 18000.0
-        + blue_coverage * (1.0 - blue_allow) * 6000.0
+        red_coverage * (1.0 - red_allow) * 12000.0
+        + yellow_coverage * (1.0 - yellow_allow) * 2500.0
+        + blue_coverage * (1.0 - blue_allow) * 9000.0
+        + green_coverage * (1.0 - green_allow) * 18000.0
         + black_penalty
     )
 
@@ -936,6 +971,7 @@ def error_diffusion_quantize(
     shadow_neutral_saturation: float,
     diffusion_strength: float,
     chroma_diffusion_strength: float,
+    neutral_diffusion_strength: float,
     serpentine: bool,
 ) -> Image.Image:
     denominator, kernel = DIFFUSION_KERNELS[kernel_name]
@@ -977,8 +1013,10 @@ def error_diffusion_quantize(
             err_b = b - pal_b
             if neutral:
                 err_r, err_g, err_b = neutralize_error(err_r, err_g, err_b)
+                pixel_diffusion_strength = neutral_diffusion_strength
             else:
                 err_r, err_g, err_b = damp_chroma_error(err_r, err_g, err_b, chroma_diffusion_strength)
+                pixel_diffusion_strength = diffusion_strength
 
             for dx, dy, weight in kernel:
                 nx = x + dx * x_direction
@@ -987,7 +1025,7 @@ def error_diffusion_quantize(
 
                 target = error_rows[dy]
                 target_offset = nx * 3
-                factor = diffusion_strength * weight / denominator
+                factor = pixel_diffusion_strength * weight / denominator
                 target[target_offset] += err_r * factor
                 target[target_offset + 1] += err_g * factor
                 target[target_offset + 2] += err_b * factor
@@ -1011,6 +1049,7 @@ def quantize_to_spectra(
     shadow_neutral_saturation: float,
     diffusion_strength: float,
     chroma_diffusion_strength: float,
+    neutral_diffusion_strength: float,
     serpentine: bool,
 ) -> Image.Image:
     if dither == "none":
@@ -1049,6 +1088,7 @@ def quantize_to_spectra(
         shadow_neutral_saturation,
         diffusion_strength,
         chroma_diffusion_strength,
+        neutral_diffusion_strength,
         serpentine,
     )
 
@@ -1292,6 +1332,12 @@ def parse_args() -> argparse.Namespace:
         help="Blend strength for dynamic range compression from 0 to 1.",
     )
     parser.add_argument(
+        "--display-gamma",
+        type=float,
+        default=DEFAULT_DISPLAY_GAMMA,
+        help="Gamma used while mapping source luma into the panel range. Values above 1 darken midtones.",
+    )
+    parser.add_argument(
         "--range-low-percentile",
         type=float,
         default=DEFAULT_RANGE_LOW_PERCENTILE,
@@ -1343,6 +1389,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_CHROMA_DIFFUSION_STRENGTH,
         help="Scale color-only diffusion error. Lower values reduce colored speckles while preserving tone.",
+    )
+    parser.add_argument(
+        "--neutral-diffusion-strength",
+        type=float,
+        default=DEFAULT_NEUTRAL_DIFFUSION_STRENGTH,
+        help="Scale black/white diffusion for neutral pixels. Keep near 1.0 to preserve gray tone.",
     )
     parser.add_argument(
         "--neutral-threshold",
@@ -1431,6 +1483,7 @@ def convert_one(
         palette_rgb=palette_rgb,
         mode=args.dynamic_range,
         strength=args.dynamic_range_strength,
+        display_gamma=args.display_gamma,
         low_percentile=args.range_low_percentile,
         high_percentile=args.range_high_percentile,
         preserve_white=not args.no_preserve_white,
@@ -1451,6 +1504,7 @@ def convert_one(
         shadow_neutral_saturation=args.shadow_neutral_saturation,
         diffusion_strength=args.diffusion_strength,
         chroma_diffusion_strength=args.chroma_diffusion_strength,
+        neutral_diffusion_strength=args.neutral_diffusion_strength,
         serpentine=not args.no_serpentine,
     )
     quantized = cleanup_dithered_edges(
