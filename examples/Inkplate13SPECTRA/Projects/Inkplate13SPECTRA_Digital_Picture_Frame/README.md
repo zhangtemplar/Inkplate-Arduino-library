@@ -38,13 +38,31 @@ Apps Script sends file content as base64 text, which is about 33% larger on the 
 
 Apps Script does not include a Pillow/canvas-quality pixel pipeline, so the included script does not convert Drive images to BIN by itself. For a Drive-first workflow, run the Python converter against a local Google Drive synced folder so it creates `.bin` siblings. In `google_drive_apps_script.gs`, set `MANIFEST_BIN_ONLY = true` when you want the Inkplate to see only generated BIN files. Leave `HIDE_SOURCE_IMAGES_WHEN_BIN_EXISTS = true` to hide JPG/PNG/BMP originals whenever a matching BIN sibling exists.
 
+## Unsplash Random Photo Sync
+
+The frame can also fetch images with Unsplash's "Get a random photo" API. Create an Unsplash developer application, copy its Access Key, then open config mode and set "Web photo source" to "Unsplash random photo". The key is stored in `/frame/config.json`; do not commit or share that file.
+
+Useful defaults for the 13SPECTRA panel:
+
+```text
+Orientation: landscape
+Output width/height: 1600 x 1200
+JPEG quality: 85
+```
+
+You can optionally constrain random results with exactly one filter: query text, topic IDs, or collection IDs. The Unsplash API does not allow those filters to be combined, so the config page clears the other filter fields when you type in one; saved configs keep collection IDs first, then topic IDs, then query text if multiple values are somehow present. Topic and collection fields expect Unsplash IDs, so look them up offline from Unsplash before pasting them into the frame UI.
+
+Each sync downloads one random JPEG to the configured SD photo folder as `unsplash_<id>_<width>x<height>.jpg`. The sketch asks Unsplash for a cropped JPEG at the requested resolution and triggers the Unsplash download tracking endpoint as required by their API guidelines.
+
+Spectra 6 generally looks cleaner with graphic art, illustration, posters, and low-noise images than with very detailed phone photos. Unsplash sync is useful for fresh artwork, but the best color control still comes from preprocessing selected images into `.bin` files with the Python converter.
+
 ## Config Mode
 
-On first boot, the frame starts an access point named `Inkplate13Frame` with password `inkplate13`. Open the IP shown on the display, usually `http://192.168.4.1`. Configure Wi-Fi, Apps Script URL, sync token, sync cadence, photo folder, shuffle mode, update interval, and low-battery threshold. After Wi-Fi is configured, config mode first tries the home network and disables the setup AP when the connection works; the display shows the home-network URL. If Wi-Fi is missing or fails, the fallback AP is enabled again.
+On first boot, the frame starts an access point named `Inkplate13Frame` with password `inkplate13`. Open the IP shown on the display, usually `http://192.168.4.1`. Configure Wi-Fi, web photo source, Drive or Unsplash credentials, sync cadence, photo folder, shuffle mode, update interval, and low-battery threshold. After Wi-Fi is configured, config mode first tries the home network and disables the setup AP when the connection works; the display shows the home-network URL. If Wi-Fi is missing or fails, the fallback AP is enabled again.
 
 To force config mode later, press the Inkplate 13SPECTRA WAKE button while the frame is sleeping; the sketch enables GPIO18 as a config-mode wake source. While config mode is running, press WAKE again to close the web UI and return to photo display mode. You can also create an empty file at `/frame/config_mode.txt`. The library does not expose a clear USB/VBUS detect pin for this board; if your hardware revision exposes one, set `USB_POWER_DETECT_PIN` near the top of the sketch so USB power automatically enters config mode.
 
-The config page shows the tail of `/frame/sync_debug.log`, and the same debug lines are printed to Serial at 115200 baud. Open `/log` for the full recent sync log and `/manifest_response` for the raw response captured from the last manifest request. Tokens are redacted from logged URLs. The "Sync photos now" button queues sync and returns immediately; while sync runs, `/log` remains available and SD-mutating commands are rejected until sync completes.
+The config page shows the tail of `/frame/sync_debug.log`, and the same debug lines are printed to Serial at 115200 baud. Open `/log` for the full recent sync log and `/manifest_response` for the raw response captured from the last Drive manifest or Unsplash API request. Tokens are redacted from logged URLs. The "Sync photos now" button queues sync and returns immediately; while sync runs, `/log` remains available and SD-mutating commands are rejected until sync completes.
 
 The config screen also renders a compact Spectra 6 profiling chart in the unused right-side area. Photograph that chart with a ColorChecker under your normal viewing light, then use `panel_profile.py measure` to create a panel profile for the BIN converter.
 
